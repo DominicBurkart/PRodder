@@ -1,0 +1,63 @@
+# prodder.example.toml
+#
+# Copy to `prodder.toml` and edit. Every field is optional; missing
+# fields fall back to the defaults described here.
+#
+# Fields match the PRodder `Config` struct (see `src/config.rs`).
+# A CI integration test (`tests/config_schema.rs`) verifies that
+# every field defined on `Config` appears in this file AND has a
+# preceding comment line, so this file is the authoritative schema
+# reference.
+
+# GitHub logins PRodder should watch.
+#
+# * Empty (the default) — PRodder will call `GET /user` with the
+#   provided PAT and target whichever login owns the token.
+# * `["*"]` — wildcard; matches any author the token can see. The
+#   default filter omits `author:` in this mode.
+# * An explicit list — only PRs authored by these logins are
+#   considered.
+#
+# GitHub REST reference:
+# https://docs.github.com/en/rest/users/users#get-the-authenticated-user
+users = []
+
+# Filter passed to GitHub's issue search API. Accepts the same
+# syntax as the search bar at https://github.com/pulls. An empty
+# string (the default) renders as `is:pr is:open author:<u> ...`
+# built from the resolved `users` above.
+#
+# GitHub search syntax reference:
+# https://docs.github.com/en/search-github/searching-on-github/searching-issues-and-pull-requests
+filter = ""
+
+# Toggleable drafter actions. Each behavior is a boolean that
+# defaults to `true`. Field names mirror the GitHub API concept
+# they act on so operators can cross-reference the linked
+# documentation.
+[behaviors]
+
+# Demote non-draft PRs whose combined status or individual check
+# runs report failure / timed_out / cancelled / action_required /
+# stale. Maps to GitHub's "required status checks" concept.
+#
+# GitHub REST reference:
+# https://docs.github.com/en/rest/commits/statuses#get-the-combined-status-for-a-specific-reference
+# https://docs.github.com/en/rest/checks/runs#list-check-runs-for-a-git-reference
+required_status_checks = true
+
+# Demote non-draft PRs that report a merge conflict
+# (`mergeable == false`). Named after the PR object's
+# `mergeable_state` field.
+#
+# GitHub REST reference:
+# https://docs.github.com/en/rest/pulls/pulls#get-a-pull-request
+mergeable_state = true
+
+# When a PR is otherwise clean but its branch is `behind` base,
+# call the update-branch endpoint so CI re-runs against the
+# current base.
+#
+# GitHub REST reference:
+# https://docs.github.com/en/rest/pulls/pulls#update-a-pull-request-branch
+update_branch = true

@@ -2,7 +2,7 @@ use std::env;
 
 use tracing_subscriber::FmtSubscriber;
 
-mod drafter;
+use prodder::drafter;
 
 fn main() -> anyhow::Result<()> {
     #[cfg(not(debug_assertions))]
