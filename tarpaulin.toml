@@ -1,0 +1,5 @@
+[default]
+# `src/main.rs` is a one-line delegating shim (`prodder::real_main()`)
+# that cannot be exercised from within `cargo test`; all meaningful
+# logic lives in `src/lib.rs` and `src/drafter.rs`.
+exclude-files = ["src/main.rs"]
