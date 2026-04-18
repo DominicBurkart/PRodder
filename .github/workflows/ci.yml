@@ -52,7 +52,7 @@ jobs:
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-tarpaulin
-      - run: cargo tarpaulin --all-features --ignore-tests --exclude-files 'src/main.rs' --out Lcov --output-dir .
+      - run: cargo tarpaulin --all-features --ignore-tests --out Lcov --output-dir .
       - uses: codecov/codecov-action@v5
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
