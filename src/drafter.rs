@@ -1,4 +1,4 @@
-//! Finds all open PRs (including drafts) authored by DominicBurkart
+//! Finds all open PRs (including drafts) authored by `DominicBurkart`
 //! in `DominicBurkart/*` repos, checks non-review merge requirements
 //! (merge conflicts, combined status, check-runs), and either:
 //!   * converts any non-draft PR with a blocking non-review requirement
@@ -55,7 +55,7 @@ enum Action {
     UpdateBranch,
 }
 
-/// Pure action selector — combines classify() with the out-of-date signal.
+/// Pure action selector — combines `classify()` with the out-of-date signal.
 /// Unit-tested without any network or subprocess.
 fn decide(
     mergeable: Option<bool>,
@@ -101,19 +101,16 @@ fn classify(
         if run.status != "completed" {
             continue;
         }
-        match run.conclusion.as_deref() {
-            Some("failure")
-            | Some("timed_out")
-            | Some("cancelled")
-            | Some("action_required")
-            | Some("stale") => {
-                return BlockDecision::Block(format!(
-                    "check '{}' {}",
-                    run.name,
-                    run.conclusion.as_deref().unwrap_or("?")
-                ));
-            }
-            _ => {}
+        if let Some(
+            "failure" | "timed_out" | "cancelled" | "action_required"
+            | "stale",
+        ) = run.conclusion.as_deref()
+        {
+            return BlockDecision::Block(format!(
+                "check '{}' {}",
+                run.name,
+                run.conclusion.as_deref().unwrap_or("?")
+            ));
         }
     }
     if mergeable.is_none() {
@@ -221,18 +218,17 @@ fn list_candidate_prs(
             .get("repository_url")
             .and_then(|v| v.as_str())
             .unwrap_or("");
-        let (owner, repo) = match repo_from_url(repo_url) {
-            Some(pair) => pair,
-            None => continue,
+        let Some((owner, repo)) = repo_from_url(repo_url) else {
+            continue;
         };
         if !format!("{owner}/{repo}").starts_with(OWNER_PREFIX) {
             continue;
         }
-        let number =
-            match issue.get("number").and_then(|v| v.as_u64()) {
-                Some(n) => n,
-                None => continue,
-            };
+        let Some(number) =
+            issue.get("number").and_then(serde_json::Value::as_u64)
+        else {
+            continue;
+        };
 
         let pr_url =
             format!("{API}/repos/{owner}/{repo}/pulls/{number}");
@@ -258,32 +254,30 @@ fn list_candidate_prs(
                 continue;
             }
         };
-        let node_id = match pr.get("node_id").and_then(|v| v.as_str())
+        let node_id = if let Some(s) =
+            pr.get("node_id").and_then(|v| v.as_str())
         {
-            Some(s) => s.to_string(),
-            None => {
-                warn!(
-                    owner,
-                    repo,
-                    number,
-                    "drafter: PR missing node_id; skipping"
-                );
-                continue;
-            }
+            s.to_string()
+        } else {
+            warn!(
+                owner,
+                repo, number, "drafter: PR missing node_id; skipping"
+            );
+            continue;
         };
-        let head_sha =
-            match pr.pointer("/head/sha").and_then(|v| v.as_str()) {
-                Some(s) => s.to_string(),
-                None => {
-                    warn!(
-                        owner,
-                        repo,
-                        number,
-                        "drafter: PR missing head.sha; skipping"
-                    );
-                    continue;
-                }
-            };
+        let head_sha = if let Some(s) =
+            pr.pointer("/head/sha").and_then(|v| v.as_str())
+        {
+            s.to_string()
+        } else {
+            warn!(
+                owner,
+                repo,
+                number,
+                "drafter: PR missing head.sha; skipping"
+            );
+            continue;
+        };
         out.push(CandidatePr {
             owner,
             repo,
@@ -304,7 +298,8 @@ fn evaluate(token: &str, c: &CandidatePr) -> anyhow::Result<Action> {
         curl(token, "GET", &pr_url, None).context("pulls.get")?;
     let pr: Value =
         serde_json::from_slice(&pr_body).context("parse pr")?;
-    let mergeable = pr.get("mergeable").and_then(|v| v.as_bool());
+    let mergeable =
+        pr.get("mergeable").and_then(serde_json::Value::as_bool);
     let mergeable_state = pr
         .get("mergeable_state")
         .and_then(|v| v.as_str())
@@ -385,7 +380,7 @@ fn convert_to_draft(
         .context("parse graphql response")?;
     if let Some(errors) = resp.get("errors") {
         let is_empty =
-            errors.as_array().map(|a| a.is_empty()).unwrap_or(false);
+            errors.as_array().is_some_and(std::vec::Vec::is_empty);
         if !is_empty {
             bail!("graphql errors: {errors}");
         }
@@ -491,7 +486,7 @@ mod tests {
         CheckRun {
             name: name.into(),
             status: status.into(),
-            conclusion: conclusion.map(|s| s.into()),
+            conclusion: conclusion.map(std::convert::Into::into),
         }
     }
 
