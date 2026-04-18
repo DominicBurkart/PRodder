@@ -22,9 +22,8 @@ use anyhow::{Context, bail};
 use serde_json::Value;
 use tracing::{info, warn};
 
-const SEARCH_QUERY: &str =
-    "is:open is:pr author:DominicBurkart archived:false";
-const OWNER_PREFIX: &str = "DominicBurkart/";
+use crate::config::{Behaviors, Config};
+
 const API: &str = "https://api.github.com";
 const USER_AGENT: &str = "PRodder";
 
@@ -67,12 +66,14 @@ fn decide(
     mergeable_state: &str,
     combined_state: &str,
     checks: &[CheckRun],
+    behaviors: &Behaviors,
 ) -> Action {
-    match classify(mergeable, combined_state, checks) {
+    match classify(mergeable, combined_state, checks, behaviors) {
         BlockDecision::Block(r) => Action::Draft(r),
         BlockDecision::Unknown => Action::Retry,
         BlockDecision::Ok => {
-            if mergeable_state == "behind" {
+            if behaviors.update_branch && mergeable_state == "behind"
+            {
                 Action::UpdateBranch
             } else {
                 Action::Nothing
@@ -93,32 +94,37 @@ fn classify(
     mergeable: Option<bool>,
     combined_state: &str,
     checks: &[CheckRun],
+    behaviors: &Behaviors,
 ) -> BlockDecision {
-    if mergeable == Some(false) {
+    if behaviors.mergeable_state && mergeable == Some(false) {
         return BlockDecision::Block("merge conflicts".into());
     }
-    if combined_state == "failure" || combined_state == "error" {
+    if behaviors.required_status_checks
+        && (combined_state == "failure" || combined_state == "error")
+    {
         return BlockDecision::Block(format!(
             "combined status {combined_state}"
         ));
     }
-    for run in checks {
-        if run.status != "completed" {
-            continue;
-        }
-        match run.conclusion.as_deref() {
-            Some("failure")
-            | Some("timed_out")
-            | Some("cancelled")
-            | Some("action_required")
-            | Some("stale") => {
-                return BlockDecision::Block(format!(
-                    "check '{}' {}",
-                    run.name,
-                    run.conclusion.as_deref().unwrap_or("?")
-                ));
+    if behaviors.required_status_checks {
+        for run in checks {
+            if run.status != "completed" {
+                continue;
             }
-            _ => {}
+            match run.conclusion.as_deref() {
+                Some("failure")
+                | Some("timed_out")
+                | Some("cancelled")
+                | Some("action_required")
+                | Some("stale") => {
+                    return BlockDecision::Block(format!(
+                        "check '{}' {}",
+                        run.name,
+                        run.conclusion.as_deref().unwrap_or("?")
+                    ));
+                }
+                _ => {}
+            }
         }
     }
     if mergeable.is_none() {
@@ -129,7 +135,11 @@ fn classify(
 
 #[tracing::instrument(skip(token))]
 pub fn run(token: &str) -> anyhow::Result<()> {
-    let candidates = match list_candidate_prs(token) {
+    let config = Config::load().context("load prodder.toml")?;
+    let users =
+        config.users.resolve(token).context("resolve users")?;
+    let query = config.filter.render(&users);
+    let candidates = match list_candidate_prs(token, &query, &users) {
         Ok(v) => v,
         Err(e) => {
             warn!("drafter: failed to list candidate PRs: {e:#}");
@@ -142,7 +152,7 @@ pub fn run(token: &str) -> anyhow::Result<()> {
     );
 
     for c in candidates {
-        let action = match evaluate(token, &c) {
+        let action = match evaluate(token, &c, &config.behaviors) {
             Ok(a) => a,
             Err(e) => {
                 warn!(
@@ -205,10 +215,13 @@ pub fn run(token: &str) -> anyhow::Result<()> {
 
 fn list_candidate_prs(
     token: &str,
+    query: &str,
+    users: &[String],
 ) -> anyhow::Result<Vec<CandidatePr>> {
+    let full_query = format!("{query} archived:false");
     let url = format!(
         "{API}/search/issues?q={}&per_page=100",
-        percent_encode(SEARCH_QUERY)
+        percent_encode(&full_query)
     );
     let body =
         curl(token, "GET", &url, None).context("search issues")?;
@@ -230,7 +243,7 @@ fn list_candidate_prs(
             Some(pair) => pair,
             None => continue,
         };
-        if !format!("{owner}/{repo}").starts_with(OWNER_PREFIX) {
+        if !owner_matches_users(&owner, users) {
             continue;
         }
         let number =
@@ -300,7 +313,21 @@ fn list_candidate_prs(
     Ok(out)
 }
 
-fn evaluate(token: &str, c: &CandidatePr) -> anyhow::Result<Action> {
+/// True when `owner` should be considered in-scope for the
+/// configured user list. Wildcard (`"*"`) and empty lists match any
+/// owner; otherwise, the owner must appear in the list.
+fn owner_matches_users(owner: &str, users: &[String]) -> bool {
+    if users.is_empty() || users.iter().any(|u| u == "*") {
+        return true;
+    }
+    users.iter().any(|u| u == owner)
+}
+
+fn evaluate(
+    token: &str,
+    c: &CandidatePr,
+    behaviors: &Behaviors,
+) -> anyhow::Result<Action> {
     let pr_url = format!(
         "{API}/repos/{}/{}/pulls/{}",
         c.owner, c.repo, c.number
@@ -367,7 +394,16 @@ fn evaluate(token: &str, c: &CandidatePr) -> anyhow::Result<Action> {
         &mergeable_state,
         &combined_state,
         &checks,
+        behaviors,
     ))
+}
+
+/// `GET /user` — returns the raw JSON bytes. Exposed so
+/// [`crate::config::Users::resolve`] can derive the default user
+/// list from the PAT without introducing a second HTTP stack.
+pub(crate) fn curl_get_user(token: &str) -> anyhow::Result<Vec<u8>> {
+    let url = format!("{API}/user");
+    curl(token, "GET", &url, None)
 }
 
 fn convert_to_draft(
@@ -556,10 +592,14 @@ mod tests {
         }
     }
 
+    fn b() -> Behaviors {
+        Behaviors::default()
+    }
+
     #[test]
     fn conflict_blocks() {
         assert!(matches!(
-            classify(Some(false), "success", &[]),
+            classify(Some(false), "success", &[], &b()),
             BlockDecision::Block(_)
         ));
     }
@@ -568,7 +608,7 @@ mod tests {
     fn failing_check_blocks() {
         let checks = vec![check("ci", "completed", Some("failure"))];
         assert!(matches!(
-            classify(Some(true), "success", &checks),
+            classify(Some(true), "success", &checks, &b()),
             BlockDecision::Block(_)
         ));
     }
@@ -576,7 +616,7 @@ mod tests {
     #[test]
     fn failing_combined_status_blocks() {
         assert!(matches!(
-            classify(Some(true), "failure", &[]),
+            classify(Some(true), "failure", &[], &b()),
             BlockDecision::Block(_)
         ));
     }
@@ -588,7 +628,7 @@ mod tests {
             check("lint", "completed", Some("neutral")),
         ];
         assert_eq!(
-            classify(Some(true), "success", &checks),
+            classify(Some(true), "success", &checks, &b()),
             BlockDecision::Ok
         );
     }
@@ -597,7 +637,7 @@ mod tests {
     fn in_progress_check_is_not_blocking() {
         let checks = vec![check("ci", "in_progress", None)];
         assert_eq!(
-            classify(Some(true), "pending", &checks),
+            classify(Some(true), "pending", &checks, &b()),
             BlockDecision::Ok
         );
     }
@@ -605,7 +645,7 @@ mod tests {
     #[test]
     fn unknown_mergeable_is_unknown() {
         assert_eq!(
-            classify(None, "success", &[]),
+            classify(None, "success", &[], &b()),
             BlockDecision::Unknown
         );
     }
@@ -614,7 +654,7 @@ mod tests {
     fn decide_behind_updates_branch() {
         let checks = vec![check("ci", "completed", Some("success"))];
         assert_eq!(
-            decide(Some(true), "behind", "success", &checks),
+            decide(Some(true), "behind", "success", &checks, &b()),
             Action::UpdateBranch
         );
     }
@@ -622,7 +662,7 @@ mod tests {
     #[test]
     fn decide_behind_on_draft_updates_branch() {
         assert_eq!(
-            decide(Some(true), "behind", "success", &[]),
+            decide(Some(true), "behind", "success", &[], &b()),
             Action::UpdateBranch
         );
     }
@@ -630,7 +670,7 @@ mod tests {
     #[test]
     fn decide_clean_does_nothing() {
         assert_eq!(
-            decide(Some(true), "clean", "success", &[]),
+            decide(Some(true), "clean", "success", &[], &b()),
             Action::Nothing
         );
     }
@@ -639,7 +679,7 @@ mod tests {
     fn decide_failing_check_drafts_even_if_behind() {
         let checks = vec![check("ci", "completed", Some("failure"))];
         assert!(matches!(
-            decide(Some(true), "behind", "success", &checks),
+            decide(Some(true), "behind", "success", &checks, &b()),
             Action::Draft(_)
         ));
     }
@@ -647,7 +687,7 @@ mod tests {
     #[test]
     fn decide_unknown_mergeable_retries() {
         assert_eq!(
-            decide(None, "unknown", "success", &[]),
+            decide(None, "unknown", "success", &[], &b()),
             Action::Retry
         );
     }
@@ -655,7 +695,7 @@ mod tests {
     #[test]
     fn decide_blocked_state_does_nothing() {
         assert_eq!(
-            decide(Some(true), "blocked", "success", &[]),
+            decide(Some(true), "blocked", "success", &[], &b()),
             Action::Nothing
         );
     }
@@ -665,8 +705,41 @@ mod tests {
         let checks =
             vec![check("ci", "completed", Some("timed_out"))];
         assert!(matches!(
-            classify(Some(true), "success", &checks),
+            classify(Some(true), "success", &checks, &b()),
             BlockDecision::Block(_)
+        ));
+    }
+
+    #[test]
+    fn behaviors_off_suppress_blocks() {
+        let off = Behaviors {
+            required_status_checks: false,
+            mergeable_state: false,
+            update_branch: false,
+        };
+        // Merge conflict would normally block.
+        assert_eq!(
+            classify(Some(false), "failure", &[], &off),
+            BlockDecision::Ok
+        );
+        // Behind + update_branch disabled ⇒ Nothing.
+        assert_eq!(
+            decide(Some(true), "behind", "success", &[], &off),
+            Action::Nothing
+        );
+    }
+
+    #[test]
+    fn owner_matches_users_wildcard_and_empty() {
+        assert!(owner_matches_users("anyone", &[]));
+        assert!(owner_matches_users("anyone", &["*".to_string()]));
+        assert!(owner_matches_users(
+            "alice",
+            &["alice".to_string(), "bob".to_string()]
+        ));
+        assert!(!owner_matches_users(
+            "carol",
+            &["alice".to_string()]
         ));
     }
 
