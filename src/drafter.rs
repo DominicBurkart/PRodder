@@ -200,6 +200,56 @@ pub fn run(token: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Owner/repo/number triple resolved from a search-API issue payload.
+#[derive(Debug, PartialEq, Eq, Clone)]
+struct IssueRef {
+    owner: String,
+    repo: String,
+    number: u64,
+}
+
+/// Parse a search-API issue payload into an [`IssueRef`], applying the
+/// [`OWNER_PREFIX`] filter. Returns `None` when the payload cannot be
+/// identified as a PR in a `DominicBurkart/*` repo.
+fn parse_issue_ref(issue: &Value) -> Option<IssueRef> {
+    let repo_url = issue
+        .get("repository_url")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let (owner, repo) = repo_from_url(repo_url)?;
+    if !format!("{owner}/{repo}").starts_with(OWNER_PREFIX) {
+        return None;
+    }
+    let number =
+        issue.get("number").and_then(serde_json::Value::as_u64)?;
+    Some(IssueRef {
+        owner,
+        repo,
+        number,
+    })
+}
+
+/// Build a [`CandidatePr`] from a PR JSON payload. Returns `None` when
+/// the payload lacks the required `node_id` or `head.sha` fields.
+fn parse_candidate_pr(
+    issue: &IssueRef,
+    pr: &Value,
+) -> Option<CandidatePr> {
+    let node_id =
+        pr.get("node_id").and_then(|v| v.as_str())?.to_string();
+    let head_sha = pr
+        .pointer("/head/sha")
+        .and_then(|v| v.as_str())?
+        .to_string();
+    Some(CandidatePr {
+        owner: issue.owner.clone(),
+        repo: issue.repo.clone(),
+        number: issue.number,
+        node_id,
+        head_sha,
+    })
+}
+
 fn list_candidate_prs(
     token: &str,
 ) -> anyhow::Result<Vec<CandidatePr>> {
@@ -219,30 +269,22 @@ fn list_candidate_prs(
 
     let mut out = Vec::new();
     for issue in items {
-        let repo_url = issue
-            .get("repository_url")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
-        let Some((owner, repo)) = repo_from_url(repo_url) else {
-            continue;
-        };
-        if !format!("{owner}/{repo}").starts_with(OWNER_PREFIX) {
-            continue;
-        }
-        let Some(number) =
-            issue.get("number").and_then(serde_json::Value::as_u64)
-        else {
+        let Some(issue_ref) = parse_issue_ref(&issue) else {
             continue;
         };
 
-        let pr_url =
-            format!("{API}/repos/{owner}/{repo}/pulls/{number}");
+        let pr_url = format!(
+            "{API}/repos/{}/{}/pulls/{}",
+            issue_ref.owner, issue_ref.repo, issue_ref.number
+        );
         let pr_body = match curl(token, "GET", &pr_url, None) {
             Ok(b) => b,
             Err(e) => {
                 warn!(
-                    owner,
-                    repo, number, "drafter: pulls.get failed: {e:#}"
+                    owner = %issue_ref.owner,
+                    repo = %issue_ref.repo,
+                    number = issue_ref.number,
+                    "drafter: pulls.get failed: {e:#}"
                 );
                 continue;
             }
@@ -251,47 +293,74 @@ fn list_candidate_prs(
             Ok(v) => v,
             Err(e) => {
                 warn!(
-                    owner,
-                    repo,
-                    number,
+                    owner = %issue_ref.owner,
+                    repo = %issue_ref.repo,
+                    number = issue_ref.number,
                     "drafter: pr json parse failed: {e:#}"
                 );
                 continue;
             }
         };
-        let node_id = if let Some(s) =
-            pr.get("node_id").and_then(|v| v.as_str())
-        {
-            s.to_string()
+        if let Some(candidate) = parse_candidate_pr(&issue_ref, &pr) {
+            out.push(candidate);
         } else {
             warn!(
-                owner,
-                repo, number, "drafter: PR missing node_id; skipping"
+                owner = %issue_ref.owner,
+                repo = %issue_ref.repo,
+                number = issue_ref.number,
+                "drafter: PR missing node_id or head.sha; skipping"
             );
-            continue;
-        };
-        let head_sha = if let Some(s) =
-            pr.pointer("/head/sha").and_then(|v| v.as_str())
-        {
-            s.to_string()
-        } else {
-            warn!(
-                owner,
-                repo,
-                number,
-                "drafter: PR missing head.sha; skipping"
-            );
-            continue;
-        };
-        out.push(CandidatePr {
-            owner,
-            repo,
-            number,
-            node_id,
-            head_sha,
-        });
+        }
     }
     Ok(out)
+}
+
+/// Extract the `(mergeable, mergeable_state)` pair from a PR payload.
+fn parse_mergeability(pr: &Value) -> (Option<bool>, String) {
+    let mergeable =
+        pr.get("mergeable").and_then(serde_json::Value::as_bool);
+    let mergeable_state = pr
+        .get("mergeable_state")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    (mergeable, mergeable_state)
+}
+
+/// Extract the `state` field from a combined-status payload.
+fn parse_combined_state(status: &Value) -> String {
+    status
+        .get("state")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string()
+}
+
+/// Extract check-run entries from a `/check-runs` payload.
+fn parse_check_runs(checks_v: &Value) -> Vec<CheckRun> {
+    let Some(arr) =
+        checks_v.get("check_runs").and_then(|v| v.as_array())
+    else {
+        return Vec::new();
+    };
+    arr.iter()
+        .map(|run| CheckRun {
+            name: run
+                .get("name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("?")
+                .to_string(),
+            status: run
+                .get("status")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string(),
+            conclusion: run
+                .get("conclusion")
+                .and_then(|v| v.as_str())
+                .map(String::from),
+        })
+        .collect()
 }
 
 fn evaluate(token: &str, c: &CandidatePr) -> anyhow::Result<Action> {
@@ -303,13 +372,7 @@ fn evaluate(token: &str, c: &CandidatePr) -> anyhow::Result<Action> {
         curl(token, "GET", &pr_url, None).context("pulls.get")?;
     let pr: Value =
         serde_json::from_slice(&pr_body).context("parse pr")?;
-    let mergeable =
-        pr.get("mergeable").and_then(serde_json::Value::as_bool);
-    let mergeable_state = pr
-        .get("mergeable_state")
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .to_string();
+    let (mergeable, mergeable_state) = parse_mergeability(&pr);
 
     let status_url = format!(
         "{API}/repos/{}/{}/commits/{}/status",
@@ -319,11 +382,7 @@ fn evaluate(token: &str, c: &CandidatePr) -> anyhow::Result<Action> {
         .context("combined status")?;
     let status: Value = serde_json::from_slice(&status_body)
         .context("parse status")?;
-    let combined_state = status
-        .get("state")
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .to_string();
+    let combined_state = parse_combined_state(&status);
 
     let checks_url = format!(
         "{API}/repos/{}/{}/commits/{}/check-runs",
@@ -333,29 +392,7 @@ fn evaluate(token: &str, c: &CandidatePr) -> anyhow::Result<Action> {
         .context("check-runs")?;
     let checks_v: Value = serde_json::from_slice(&checks_body)
         .context("parse check-runs")?;
-    let mut checks = Vec::new();
-    if let Some(arr) =
-        checks_v.get("check_runs").and_then(|v| v.as_array())
-    {
-        for run in arr {
-            checks.push(CheckRun {
-                name: run
-                    .get("name")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("?")
-                    .to_string(),
-                status: run
-                    .get("status")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string(),
-                conclusion: run
-                    .get("conclusion")
-                    .and_then(|v| v.as_str())
-                    .map(String::from),
-            });
-        }
-    }
+    let checks = parse_check_runs(&checks_v);
 
     Ok(decide(
         mergeable,
@@ -383,15 +420,20 @@ fn convert_to_draft(
     .context("graphql convertPullRequestToDraft")?;
     let resp: Value = serde_json::from_slice(&resp_bytes)
         .context("parse graphql response")?;
-    if let Some(errors) = resp.get("errors") {
-        let is_empty =
-            errors.as_array().is_some_and(std::vec::Vec::is_empty);
-        if !is_empty {
-            bail!("graphql errors: {errors}");
-        }
+    if graphql_has_errors(&resp) {
+        bail!("graphql errors: {}", &resp["errors"]);
     }
     info!(node_id, "drafter: PR converted to draft");
     Ok(())
+}
+
+/// Return `true` when a GraphQL response carries a non-empty `errors`
+/// array. A missing `errors` key or an empty array both mean success.
+fn graphql_has_errors(resp: &Value) -> bool {
+    let Some(errors) = resp.get("errors") else {
+        return false;
+    };
+    !errors.as_array().is_some_and(std::vec::Vec::is_empty)
 }
 
 /// Ask GitHub to merge the base branch into the PR's head branch.
@@ -699,5 +741,193 @@ mod tests {
             cfg_escape("Bearer ghp_abc123"),
             "Bearer ghp_abc123"
         );
+    }
+
+    fn issue_ref(owner: &str, repo: &str, number: u64) -> IssueRef {
+        IssueRef {
+            owner: owner.into(),
+            repo: repo.into(),
+            number,
+        }
+    }
+
+    #[test]
+    fn parse_issue_ref_accepts_owner_prefix() {
+        let issue = serde_json::json!({
+            "repository_url": "https://api.github.com/repos/DominicBurkart/committer",
+            "number": 42,
+        });
+        assert_eq!(
+            parse_issue_ref(&issue),
+            Some(issue_ref("DominicBurkart", "committer", 42))
+        );
+    }
+
+    #[test]
+    fn parse_issue_ref_rejects_other_owner() {
+        let issue = serde_json::json!({
+            "repository_url": "https://api.github.com/repos/other/repo",
+            "number": 1,
+        });
+        assert_eq!(parse_issue_ref(&issue), None);
+    }
+
+    #[test]
+    fn parse_issue_ref_rejects_missing_repo_url() {
+        let issue = serde_json::json!({ "number": 1 });
+        assert_eq!(parse_issue_ref(&issue), None);
+    }
+
+    #[test]
+    fn parse_issue_ref_rejects_missing_number() {
+        let issue = serde_json::json!({
+            "repository_url": "https://api.github.com/repos/DominicBurkart/committer",
+        });
+        assert_eq!(parse_issue_ref(&issue), None);
+    }
+
+    #[test]
+    fn parse_candidate_pr_extracts_node_id_and_sha() {
+        let issue = issue_ref("DominicBurkart", "committer", 7);
+        let pr = serde_json::json!({
+            "node_id": "PR_kwDO",
+            "head": { "sha": "deadbeef" },
+        });
+        let candidate =
+            parse_candidate_pr(&issue, &pr).expect("candidate");
+        assert_eq!(candidate.owner, "DominicBurkart");
+        assert_eq!(candidate.repo, "committer");
+        assert_eq!(candidate.number, 7);
+        assert_eq!(candidate.node_id, "PR_kwDO");
+        assert_eq!(candidate.head_sha, "deadbeef");
+    }
+
+    #[test]
+    fn parse_candidate_pr_missing_node_id_is_none() {
+        let issue = issue_ref("DominicBurkart", "r", 1);
+        let pr = serde_json::json!({ "head": { "sha": "abc" } });
+        assert!(parse_candidate_pr(&issue, &pr).is_none());
+    }
+
+    #[test]
+    fn parse_candidate_pr_missing_head_sha_is_none() {
+        let issue = issue_ref("DominicBurkart", "r", 1);
+        let pr = serde_json::json!({ "node_id": "PR_x" });
+        assert!(parse_candidate_pr(&issue, &pr).is_none());
+    }
+
+    #[test]
+    fn parse_mergeability_reads_fields() {
+        let pr = serde_json::json!({
+            "mergeable": true,
+            "mergeable_state": "clean",
+        });
+        let (m, state) = parse_mergeability(&pr);
+        assert_eq!(m, Some(true));
+        assert_eq!(state, "clean");
+    }
+
+    #[test]
+    fn parse_mergeability_handles_missing_fields() {
+        let pr = serde_json::json!({});
+        let (m, state) = parse_mergeability(&pr);
+        assert_eq!(m, None);
+        assert_eq!(state, "");
+    }
+
+    #[test]
+    fn parse_mergeability_false_and_behind() {
+        let pr = serde_json::json!({
+            "mergeable": false,
+            "mergeable_state": "behind",
+        });
+        let (m, state) = parse_mergeability(&pr);
+        assert_eq!(m, Some(false));
+        assert_eq!(state, "behind");
+    }
+
+    #[test]
+    fn parse_combined_state_extracts_state() {
+        let status = serde_json::json!({ "state": "success" });
+        assert_eq!(parse_combined_state(&status), "success");
+    }
+
+    #[test]
+    fn parse_combined_state_missing_is_empty() {
+        assert_eq!(parse_combined_state(&serde_json::json!({})), "");
+    }
+
+    #[test]
+    fn parse_check_runs_extracts_all_fields() {
+        let body = serde_json::json!({
+            "check_runs": [
+                {
+                    "name": "lint",
+                    "status": "completed",
+                    "conclusion": "success",
+                },
+                {
+                    "name": "test",
+                    "status": "in_progress",
+                    "conclusion": null,
+                },
+            ]
+        });
+        let runs = parse_check_runs(&body);
+        assert_eq!(runs.len(), 2);
+        assert_eq!(runs[0].name, "lint");
+        assert_eq!(runs[0].status, "completed");
+        assert_eq!(runs[0].conclusion.as_deref(), Some("success"));
+        assert_eq!(runs[1].name, "test");
+        assert_eq!(runs[1].status, "in_progress");
+        assert_eq!(runs[1].conclusion, None);
+    }
+
+    #[test]
+    fn parse_check_runs_missing_array_is_empty() {
+        assert!(parse_check_runs(&serde_json::json!({})).is_empty());
+    }
+
+    #[test]
+    fn parse_check_runs_defaults_missing_fields() {
+        let body = serde_json::json!({
+            "check_runs": [ {} ],
+        });
+        let runs = parse_check_runs(&body);
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].name, "?");
+        assert_eq!(runs[0].status, "");
+        assert_eq!(runs[0].conclusion, None);
+    }
+
+    #[test]
+    fn graphql_has_errors_missing_key_is_false() {
+        assert!(!graphql_has_errors(&serde_json::json!({
+            "data": { "convertPullRequestToDraft": {} }
+        })));
+    }
+
+    #[test]
+    fn graphql_has_errors_empty_array_is_false() {
+        assert!(!graphql_has_errors(
+            &serde_json::json!({ "errors": [] })
+        ));
+    }
+
+    #[test]
+    fn graphql_has_errors_non_empty_is_true() {
+        assert!(graphql_has_errors(&serde_json::json!({
+            "errors": [ { "message": "nope" } ]
+        })));
+    }
+
+    #[test]
+    fn graphql_has_errors_non_array_is_true() {
+        // A non-array `errors` value is still considered an error;
+        // `is_some_and(Vec::is_empty)` returns false when the value
+        // isn't an array.
+        assert!(graphql_has_errors(&serde_json::json!({
+            "errors": "something went wrong"
+        })));
     }
 }
