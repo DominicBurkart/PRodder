@@ -1,7 +1,6 @@
 # PRodder
 
-[![tests](https://github.com/DominicBurkart/PRodder/workflows/tests/badge.svg)](https://github.com/DominicBurkart/PRodder/actions/workflows/tests.yaml)
-[![style](https://github.com/DominicBurkart/PRodder/workflows/style/badge.svg)](https://github.com/DominicBurkart/PRodder/actions/workflows/style.yaml)
+[![CI](https://github.com/DominicBurkart/PRodder/actions/workflows/ci.yml/badge.svg)](https://github.com/DominicBurkart/PRodder/actions/workflows/ci.yml)
 [![codecov](https://codecov.io/gh/DominicBurkart/PRodder/graph/badge.svg)](https://codecov.io/gh/DominicBurkart/PRodder)
 [![license](https://img.shields.io/badge/license-MIT%2FApache--2.0-blue.svg)](https://github.com/DominicBurkart/PRodder#license)
 [![last commit](https://img.shields.io/github/last-commit/dominicburkart/prodder)](https://github.com/DominicBurkart/PRodder)
