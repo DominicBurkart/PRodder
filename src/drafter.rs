@@ -41,6 +41,47 @@ struct CandidatePr {
     head_sha: String,
 }
 
+/// HTTP transport abstraction. The production impl shells out to `curl`;
+/// tests swap in a mock to exercise the request/response logic without
+/// spawning a subprocess or touching the network.
+pub(crate) trait Transport {
+    /// Perform an HTTP request and return the raw response body.
+    ///
+    /// # Errors
+    /// Implementations return an error if the request fails to send or
+    /// the server responds with a non-success status.
+    fn request(
+        &self,
+        method: &str,
+        url: &str,
+        body: Option<&[u8]>,
+    ) -> anyhow::Result<Vec<u8>>;
+}
+
+struct CurlTransport<'a> {
+    token: &'a str,
+    bin: String,
+}
+
+impl<'a> CurlTransport<'a> {
+    fn new(token: &'a str) -> Self {
+        let bin = std::env::var("PRODDER_CURL_BIN")
+            .unwrap_or_else(|_| "curl".to_string());
+        Self { token, bin }
+    }
+}
+
+impl Transport for CurlTransport<'_> {
+    fn request(
+        &self,
+        method: &str,
+        url: &str,
+        body: Option<&[u8]>,
+    ) -> anyhow::Result<Vec<u8>> {
+        curl(&self.bin, self.token, method, url, body)
+    }
+}
+
 #[derive(Debug, PartialEq, Eq, Clone)]
 enum BlockDecision {
     Block(String),
@@ -124,13 +165,24 @@ fn classify(
     BlockDecision::Ok
 }
 
-#[tracing::instrument(skip(token))]
+/// Run the drafter against the GitHub API using the supplied token.
+///
+/// # Errors
+/// Returns an error only for unexpected internal failures. Network,
+/// parse, and per-PR errors are logged and swallowed so the cycle as a
+/// whole makes best-effort progress.
 pub fn run(token: &str) -> anyhow::Result<()> {
-    let candidates = match list_candidate_prs(token) {
+    let transport = CurlTransport::new(token);
+    run_with(&transport);
+    Ok(())
+}
+
+fn run_with(t: &dyn Transport) {
+    let candidates = match list_candidate_prs(t) {
         Ok(v) => v,
         Err(e) => {
             warn!("drafter: failed to list candidate PRs: {e:#}");
-            return Ok(());
+            return;
         }
     };
     info!(
@@ -139,76 +191,51 @@ pub fn run(token: &str) -> anyhow::Result<()> {
     );
 
     for c in candidates {
-        let action = match evaluate(token, &c) {
+        let action = match evaluate(t, &c) {
             Ok(a) => a,
             Err(e) => {
-                warn!(
-                    owner = %c.owner, repo = %c.repo, number = c.number,
-                    "drafter: failed to evaluate PR: {e:#}"
-                );
+                warn!(owner = %c.owner, repo = %c.repo, number = c.number, "drafter: failed to evaluate PR: {e:#}");
                 continue;
             }
         };
         match action {
             Action::Draft(reason) => {
-                info!(
-                    owner = %c.owner, repo = %c.repo, number = c.number,
-                    %reason,
-                    "drafter: converting PR to draft"
-                );
-                if let Err(e) = convert_to_draft(token, &c.node_id) {
-                    warn!(
-                        owner = %c.owner, repo = %c.repo,
-                        number = c.number,
-                        "drafter: convert_to_draft failed: {e:#}"
-                    );
+                info!(owner = %c.owner, repo = %c.repo, number = c.number, %reason, "drafter: converting PR to draft");
+                if let Err(e) = convert_to_draft(t, &c.node_id) {
+                    warn!(owner = %c.owner, repo = %c.repo, number = c.number, "drafter: convert_to_draft failed: {e:#}");
                 }
             }
             Action::UpdateBranch => {
-                info!(
-                    owner = %c.owner, repo = %c.repo, number = c.number,
-                    "drafter: branch is behind base; pushing update"
-                );
+                info!(owner = %c.owner, repo = %c.repo, number = c.number, "drafter: branch is behind base; pushing update");
                 if let Err(e) = update_branch(
-                    token,
+                    t,
                     &c.owner,
                     &c.repo,
                     c.number,
                     &c.head_sha,
                 ) {
-                    warn!(
-                        owner = %c.owner, repo = %c.repo,
-                        number = c.number,
-                        "drafter: update_branch failed: {e:#}"
-                    );
+                    warn!(owner = %c.owner, repo = %c.repo, number = c.number, "drafter: update_branch failed: {e:#}");
                 }
             }
             Action::Retry => {
-                info!(
-                    owner = %c.owner, repo = %c.repo, number = c.number,
-                    "drafter: mergeability unknown, will retry next cycle"
-                );
+                info!(owner = %c.owner, repo = %c.repo, number = c.number, "drafter: mergeability unknown, will retry next cycle");
             }
             Action::Nothing => {
-                info!(
-                    owner = %c.owner, repo = %c.repo, number = c.number,
-                    "drafter: PR has no blocking non-review requirements"
-                );
+                info!(owner = %c.owner, repo = %c.repo, number = c.number, "drafter: PR has no blocking non-review requirements");
             }
         }
     }
-    Ok(())
 }
 
 fn list_candidate_prs(
-    token: &str,
+    t: &dyn Transport,
 ) -> anyhow::Result<Vec<CandidatePr>> {
     let url = format!(
         "{API}/search/issues?q={}&per_page=100",
         percent_encode(SEARCH_QUERY)
     );
     let body =
-        curl(token, "GET", &url, None).context("search issues")?;
+        t.request("GET", &url, None).context("search issues")?;
     let v: Value = serde_json::from_slice(&body)
         .context("parse search response")?;
     let items = v
@@ -237,7 +264,7 @@ fn list_candidate_prs(
 
         let pr_url =
             format!("{API}/repos/{owner}/{repo}/pulls/{number}");
-        let pr_body = match curl(token, "GET", &pr_url, None) {
+        let pr_body = match t.request("GET", &pr_url, None) {
             Ok(b) => b,
             Err(e) => {
                 warn!(
@@ -294,13 +321,16 @@ fn list_candidate_prs(
     Ok(out)
 }
 
-fn evaluate(token: &str, c: &CandidatePr) -> anyhow::Result<Action> {
+fn evaluate(
+    t: &dyn Transport,
+    c: &CandidatePr,
+) -> anyhow::Result<Action> {
     let pr_url = format!(
         "{API}/repos/{}/{}/pulls/{}",
         c.owner, c.repo, c.number
     );
     let pr_body =
-        curl(token, "GET", &pr_url, None).context("pulls.get")?;
+        t.request("GET", &pr_url, None).context("pulls.get")?;
     let pr: Value =
         serde_json::from_slice(&pr_body).context("parse pr")?;
     let mergeable =
@@ -315,7 +345,8 @@ fn evaluate(token: &str, c: &CandidatePr) -> anyhow::Result<Action> {
         "{API}/repos/{}/{}/commits/{}/status",
         c.owner, c.repo, c.head_sha
     );
-    let status_body = curl(token, "GET", &status_url, None)
+    let status_body = t
+        .request("GET", &status_url, None)
         .context("combined status")?;
     let status: Value = serde_json::from_slice(&status_body)
         .context("parse status")?;
@@ -329,8 +360,8 @@ fn evaluate(token: &str, c: &CandidatePr) -> anyhow::Result<Action> {
         "{API}/repos/{}/{}/commits/{}/check-runs",
         c.owner, c.repo, c.head_sha
     );
-    let checks_body = curl(token, "GET", &checks_url, None)
-        .context("check-runs")?;
+    let checks_body =
+        t.request("GET", &checks_url, None).context("check-runs")?;
     let checks_v: Value = serde_json::from_slice(&checks_body)
         .context("parse check-runs")?;
     let mut checks = Vec::new();
@@ -366,7 +397,7 @@ fn evaluate(token: &str, c: &CandidatePr) -> anyhow::Result<Action> {
 }
 
 fn convert_to_draft(
-    token: &str,
+    t: &dyn Transport,
     node_id: &str,
 ) -> anyhow::Result<()> {
     let body = serde_json::json!({
@@ -374,13 +405,9 @@ fn convert_to_draft(
         "variables": { "id": node_id },
     });
     let body_bytes = serde_json::to_vec(&body)?;
-    let resp_bytes = curl(
-        token,
-        "POST",
-        &format!("{API}/graphql"),
-        Some(&body_bytes),
-    )
-    .context("graphql convertPullRequestToDraft")?;
+    let resp_bytes = t
+        .request("POST", &format!("{API}/graphql"), Some(&body_bytes))
+        .context("graphql convertPullRequestToDraft")?;
     let resp: Value = serde_json::from_slice(&resp_bytes)
         .context("parse graphql response")?;
     if let Some(errors) = resp.get("errors") {
@@ -400,7 +427,7 @@ fn convert_to_draft(
 /// the head moved between our evaluation and this call, preventing a
 /// race with a concurrent push.
 fn update_branch(
-    token: &str,
+    t: &dyn Transport,
     owner: &str,
     repo: &str,
     number: u64,
@@ -412,7 +439,7 @@ fn update_branch(
     let url = format!(
         "{API}/repos/{owner}/{repo}/pulls/{number}/update-branch"
     );
-    curl(token, "PUT", &url, Some(&body_bytes))
+    t.request("PUT", &url, Some(&body_bytes))
         .context("pulls.update-branch")?;
     info!(owner, repo, number, "drafter: update-branch requested");
     Ok(())
@@ -425,6 +452,7 @@ fn update_branch(
 /// likewise placed in the config as `data-binary = "..."` with
 /// backslash escapes for `\` and `"`.
 fn curl(
+    bin: &str,
     token: &str,
     method: &str,
     url: &str,
@@ -456,7 +484,7 @@ fn curl(
         ));
     }
 
-    let mut child = Command::new("curl")
+    let mut child = Command::new(bin)
         .args([
             "--silent",
             "--show-error",
@@ -536,8 +564,10 @@ fn repo_from_url(url: &str) -> Option<(String, String)> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
+    use std::cell::RefCell;
+    use std::collections::VecDeque;
 
     fn check(
         name: &str,
@@ -549,6 +579,82 @@ mod tests {
             status: status.into(),
             conclusion: conclusion.map(std::convert::Into::into),
         }
+    }
+
+    /// `(method, url, body)` tuple recorded for each request.
+    pub type RecordedCall = (String, String, Option<Vec<u8>>);
+
+    /// In-memory transport: returns queued responses in FIFO order and
+    /// records each call for later assertions.
+    pub struct MockTransport {
+        responses: RefCell<VecDeque<anyhow::Result<Vec<u8>>>>,
+        calls: RefCell<Vec<RecordedCall>>,
+    }
+
+    impl MockTransport {
+        pub const fn new() -> Self {
+            Self {
+                responses: RefCell::new(VecDeque::new()),
+                calls: RefCell::new(Vec::new()),
+            }
+        }
+
+        pub fn queue_ok(self, body: &[u8]) -> Self {
+            self.responses.borrow_mut().push_back(Ok(body.to_vec()));
+            self
+        }
+
+        pub fn queue_err(self, msg: &str) -> Self {
+            self.responses
+                .borrow_mut()
+                .push_back(Err(anyhow::anyhow!(msg.to_string())));
+            self
+        }
+
+        pub fn calls(&self) -> Vec<RecordedCall> {
+            self.calls.borrow().clone()
+        }
+    }
+
+    impl Transport for MockTransport {
+        fn request(
+            &self,
+            method: &str,
+            url: &str,
+            body: Option<&[u8]>,
+        ) -> anyhow::Result<Vec<u8>> {
+            self.calls.borrow_mut().push((
+                method.to_string(),
+                url.to_string(),
+                body.map(<[u8]>::to_vec),
+            ));
+            self.responses.borrow_mut().pop_front().expect(
+                "MockTransport: no queued response for this call",
+            )
+        }
+    }
+
+    fn candidate() -> CandidatePr {
+        CandidatePr {
+            owner: "DominicBurkart".into(),
+            repo: "committer".into(),
+            number: 7,
+            node_id: "PR_1".into(),
+            head_sha: "deadbeef".into(),
+        }
+    }
+
+    fn search_one_item() -> Vec<u8> {
+        br#"{"items":[{
+            "repository_url": "https://api.github.com/repos/DominicBurkart/committer",
+            "number": 7
+        }]}"#
+            .to_vec()
+    }
+
+    fn pr_ok() -> Vec<u8> {
+        br#"{"node_id":"PR_1","head":{"sha":"deadbeef"},"mergeable":true,"mergeable_state":"clean"}"#
+            .to_vec()
     }
 
     #[test]
@@ -681,6 +787,14 @@ mod tests {
     }
 
     #[test]
+    fn repo_from_url_rejects_empty_repo() {
+        assert_eq!(
+            repo_from_url("https://api.github.com/repos/owner/"),
+            None
+        );
+    }
+
+    #[test]
     fn percent_encode_search_query() {
         assert_eq!(
             percent_encode("is:open is:pr author:DominicBurkart"),
@@ -699,5 +813,532 @@ mod tests {
             cfg_escape("Bearer ghp_abc123"),
             "Bearer ghp_abc123"
         );
+    }
+
+    // ----- list_candidate_prs -----
+
+    #[test]
+    fn list_candidate_prs_returns_matching() {
+        let t = MockTransport::new()
+            .queue_ok(&search_one_item())
+            .queue_ok(&pr_ok());
+        let out = list_candidate_prs(&t).unwrap();
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].owner, "DominicBurkart");
+        assert_eq!(out[0].repo, "committer");
+        assert_eq!(out[0].number, 7);
+        assert_eq!(out[0].node_id, "PR_1");
+        assert_eq!(out[0].head_sha, "deadbeef");
+        let calls = t.calls();
+        assert_eq!(calls.len(), 2);
+        assert!(calls[0].1.contains("/search/issues"));
+        assert!(
+            calls[1]
+                .1
+                .contains("/repos/DominicBurkart/committer/pulls/7")
+        );
+    }
+
+    #[test]
+    fn list_candidate_prs_skips_missing_repo_url() {
+        let body = br#"{"items":[{"number":1}]}"#;
+        let t = MockTransport::new().queue_ok(body);
+        let out = list_candidate_prs(&t).unwrap();
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn list_candidate_prs_skips_foreign_owner() {
+        let body = br#"{"items":[{
+            "repository_url": "https://api.github.com/repos/OtherUser/repo",
+            "number": 1
+        }]}"#;
+        let t = MockTransport::new().queue_ok(body);
+        let out = list_candidate_prs(&t).unwrap();
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn list_candidate_prs_skips_missing_number() {
+        let body = br#"{"items":[{
+            "repository_url": "https://api.github.com/repos/DominicBurkart/committer"
+        }]}"#;
+        let t = MockTransport::new().queue_ok(body);
+        let out = list_candidate_prs(&t).unwrap();
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn list_candidate_prs_skips_when_pulls_get_fails() {
+        let t = MockTransport::new()
+            .queue_ok(&search_one_item())
+            .queue_err("network down");
+        let out = list_candidate_prs(&t).unwrap();
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn list_candidate_prs_skips_invalid_pr_json() {
+        let t = MockTransport::new()
+            .queue_ok(&search_one_item())
+            .queue_ok(b"{not valid json");
+        let out = list_candidate_prs(&t).unwrap();
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn list_candidate_prs_skips_missing_node_id() {
+        let t = MockTransport::new()
+            .queue_ok(&search_one_item())
+            .queue_ok(br#"{"head":{"sha":"deadbeef"}}"#);
+        let out = list_candidate_prs(&t).unwrap();
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn list_candidate_prs_skips_missing_head_sha() {
+        let t = MockTransport::new()
+            .queue_ok(&search_one_item())
+            .queue_ok(br#"{"node_id":"PR_1"}"#);
+        let out = list_candidate_prs(&t).unwrap();
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn list_candidate_prs_ignores_non_array_items() {
+        // `items` is absent entirely; search returned an error payload.
+        let t = MockTransport::new()
+            .queue_ok(br#"{"message":"rate limit"}"#);
+        let out = list_candidate_prs(&t).unwrap();
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn list_candidate_prs_propagates_search_error() {
+        let t = MockTransport::new().queue_err("search boom");
+        assert!(list_candidate_prs(&t).is_err());
+    }
+
+    // ----- evaluate -----
+
+    #[test]
+    fn evaluate_returns_nothing_on_clean() {
+        let t = MockTransport::new()
+            .queue_ok(&pr_ok())
+            .queue_ok(br#"{"state":"success"}"#)
+            .queue_ok(br#"{"check_runs":[]}"#);
+        assert_eq!(
+            evaluate(&t, &candidate()).unwrap(),
+            Action::Nothing
+        );
+    }
+
+    #[test]
+    fn evaluate_returns_update_branch_when_behind() {
+        let t = MockTransport::new()
+            .queue_ok(br#"{"mergeable":true,"mergeable_state":"behind"}"#)
+            .queue_ok(br#"{"state":"success"}"#)
+            .queue_ok(br#"{"check_runs":[{"name":"ci","status":"completed","conclusion":"success"}]}"#);
+        assert_eq!(
+            evaluate(&t, &candidate()).unwrap(),
+            Action::UpdateBranch
+        );
+    }
+
+    #[test]
+    fn evaluate_returns_draft_on_failing_check() {
+        let t = MockTransport::new()
+            .queue_ok(&pr_ok())
+            .queue_ok(br#"{"state":"success"}"#)
+            .queue_ok(
+                br#"{"check_runs":[{"name":"ci","status":"completed","conclusion":"failure"}]}"#,
+            );
+        let got = evaluate(&t, &candidate()).unwrap();
+        assert!(matches!(got, Action::Draft(_)));
+    }
+
+    #[test]
+    fn evaluate_handles_missing_check_runs_key() {
+        let t = MockTransport::new()
+            .queue_ok(&pr_ok())
+            .queue_ok(br#"{"state":"success"}"#)
+            .queue_ok(b"{}");
+        assert_eq!(
+            evaluate(&t, &candidate()).unwrap(),
+            Action::Nothing
+        );
+    }
+
+    #[test]
+    fn evaluate_returns_retry_when_mergeable_unknown() {
+        let t = MockTransport::new()
+            .queue_ok(
+                br#"{"mergeable":null,"mergeable_state":"unknown"}"#,
+            )
+            .queue_ok(br#"{"state":"pending"}"#)
+            .queue_ok(br#"{"check_runs":[]}"#);
+        assert_eq!(
+            evaluate(&t, &candidate()).unwrap(),
+            Action::Retry
+        );
+    }
+
+    #[test]
+    fn evaluate_bubbles_pr_fetch_error() {
+        let t = MockTransport::new().queue_err("pr boom");
+        assert!(evaluate(&t, &candidate()).is_err());
+    }
+
+    #[test]
+    fn evaluate_bubbles_status_fetch_error() {
+        let t = MockTransport::new()
+            .queue_ok(&pr_ok())
+            .queue_err("status boom");
+        assert!(evaluate(&t, &candidate()).is_err());
+    }
+
+    #[test]
+    fn evaluate_bubbles_checks_fetch_error() {
+        let t = MockTransport::new()
+            .queue_ok(&pr_ok())
+            .queue_ok(br#"{"state":"success"}"#)
+            .queue_err("checks boom");
+        assert!(evaluate(&t, &candidate()).is_err());
+    }
+
+    #[test]
+    fn evaluate_bubbles_pr_parse_error() {
+        let t = MockTransport::new().queue_ok(b"{not json");
+        assert!(evaluate(&t, &candidate()).is_err());
+    }
+
+    #[test]
+    fn evaluate_bubbles_status_parse_error() {
+        let t = MockTransport::new()
+            .queue_ok(&pr_ok())
+            .queue_ok(b"{not json");
+        assert!(evaluate(&t, &candidate()).is_err());
+    }
+
+    #[test]
+    fn evaluate_bubbles_checks_parse_error() {
+        let t = MockTransport::new()
+            .queue_ok(&pr_ok())
+            .queue_ok(br#"{"state":"success"}"#)
+            .queue_ok(b"{not json");
+        assert!(evaluate(&t, &candidate()).is_err());
+    }
+
+    // ----- convert_to_draft -----
+
+    #[test]
+    fn convert_to_draft_succeeds_on_empty_errors() {
+        let t = MockTransport::new().queue_ok(br#"{"errors":[]}"#);
+        convert_to_draft(&t, "PR_1").unwrap();
+        let calls = t.calls();
+        assert_eq!(calls[0].0, "POST");
+        assert!(calls[0].1.ends_with("/graphql"));
+        assert!(calls[0].2.is_some());
+    }
+
+    #[test]
+    fn convert_to_draft_succeeds_without_errors_key() {
+        let t = MockTransport::new().queue_ok(
+            br#"{"data":{"convertPullRequestToDraft":{}}}"#,
+        );
+        convert_to_draft(&t, "PR_1").unwrap();
+    }
+
+    #[test]
+    fn convert_to_draft_bails_on_errors() {
+        let t = MockTransport::new()
+            .queue_ok(br#"{"errors":[{"message":"nope"}]}"#);
+        let err = convert_to_draft(&t, "PR_1").unwrap_err();
+        assert!(err.to_string().contains("graphql errors"));
+    }
+
+    #[test]
+    fn convert_to_draft_bubbles_transport_error() {
+        let t = MockTransport::new().queue_err("transport boom");
+        assert!(convert_to_draft(&t, "PR_1").is_err());
+    }
+
+    #[test]
+    fn convert_to_draft_bubbles_parse_error() {
+        let t = MockTransport::new().queue_ok(b"{not json");
+        assert!(convert_to_draft(&t, "PR_1").is_err());
+    }
+
+    // ----- update_branch -----
+
+    #[test]
+    fn update_branch_sends_put_with_expected_head() {
+        let t = MockTransport::new().queue_ok(b"{}");
+        update_branch(
+            &t,
+            "DominicBurkart",
+            "committer",
+            7,
+            "deadbeef",
+        )
+        .unwrap();
+        let calls = t.calls();
+        assert_eq!(calls[0].0, "PUT");
+        assert!(calls[0].1.contains("/pulls/7/update-branch"));
+        let body = calls[0].2.as_ref().unwrap();
+        let parsed: serde_json::Value =
+            serde_json::from_slice(body).unwrap();
+        assert_eq!(parsed["expected_head_sha"], "deadbeef");
+    }
+
+    #[test]
+    fn update_branch_bubbles_transport_error() {
+        let t = MockTransport::new().queue_err("boom");
+        assert!(update_branch(&t, "o", "r", 1, "sha").is_err());
+    }
+
+    // ----- run_with -----
+
+    #[test]
+    fn run_with_swallows_list_error() {
+        let t = MockTransport::new().queue_err("list boom");
+        run_with(&t);
+    }
+
+    #[test]
+    fn run_with_no_candidates_is_ok() {
+        let t = MockTransport::new().queue_ok(br#"{"items":[]}"#);
+        run_with(&t);
+    }
+
+    #[test]
+    fn run_with_handles_nothing_action() {
+        // search + pr-for-list + pr-for-eval + status + checks
+        let t = MockTransport::new()
+            .queue_ok(&search_one_item())
+            .queue_ok(&pr_ok())
+            .queue_ok(&pr_ok())
+            .queue_ok(br#"{"state":"success"}"#)
+            .queue_ok(br#"{"check_runs":[]}"#);
+        run_with(&t);
+    }
+
+    #[test]
+    fn run_with_handles_retry_action() {
+        let t = MockTransport::new()
+            .queue_ok(&search_one_item())
+            .queue_ok(&pr_ok())
+            .queue_ok(
+                br#"{"mergeable":null,"mergeable_state":"unknown"}"#,
+            )
+            .queue_ok(br#"{"state":"pending"}"#)
+            .queue_ok(br#"{"check_runs":[]}"#);
+        run_with(&t);
+    }
+
+    #[test]
+    fn run_with_skips_on_evaluate_error() {
+        // search returns an item; the first evaluate call (pr fetch) fails.
+        let t = MockTransport::new()
+            .queue_ok(&search_one_item())
+            .queue_ok(&pr_ok())
+            .queue_err("pr boom");
+        run_with(&t);
+    }
+
+    #[test]
+    fn run_with_drafts_then_converts() {
+        let failing_checks = br#"{"check_runs":[{"name":"ci","status":"completed","conclusion":"failure"}]}"#;
+        let t = MockTransport::new()
+            .queue_ok(&search_one_item())
+            .queue_ok(&pr_ok())
+            .queue_ok(&pr_ok())
+            .queue_ok(br#"{"state":"success"}"#)
+            .queue_ok(failing_checks)
+            .queue_ok(br#"{"errors":[]}"#);
+        run_with(&t);
+    }
+
+    #[test]
+    fn run_with_logs_when_convert_to_draft_fails() {
+        let failing_checks = br#"{"check_runs":[{"name":"ci","status":"completed","conclusion":"failure"}]}"#;
+        let t = MockTransport::new()
+            .queue_ok(&search_one_item())
+            .queue_ok(&pr_ok())
+            .queue_ok(&pr_ok())
+            .queue_ok(br#"{"state":"success"}"#)
+            .queue_ok(failing_checks)
+            .queue_err("graphql boom");
+        run_with(&t);
+    }
+
+    #[test]
+    fn run_with_updates_branch_when_behind() {
+        let t = MockTransport::new()
+            .queue_ok(&search_one_item())
+            .queue_ok(&pr_ok())
+            .queue_ok(
+                br#"{"mergeable":true,"mergeable_state":"behind"}"#,
+            )
+            .queue_ok(br#"{"state":"success"}"#)
+            .queue_ok(br#"{"check_runs":[]}"#)
+            .queue_ok(b"{}");
+        run_with(&t);
+    }
+
+    #[test]
+    fn run_with_logs_when_update_branch_fails() {
+        let t = MockTransport::new()
+            .queue_ok(&search_one_item())
+            .queue_ok(&pr_ok())
+            .queue_ok(
+                br#"{"mergeable":true,"mergeable_state":"behind"}"#,
+            )
+            .queue_ok(br#"{"state":"success"}"#)
+            .queue_ok(br#"{"check_runs":[]}"#)
+            .queue_err("update-branch boom");
+        run_with(&t);
+    }
+
+    // ----- CurlTransport -----
+
+    #[cfg(unix)]
+    #[test]
+    fn curl_transport_defaults_bin_to_curl() {
+        let _guard = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Safety: guarded by ENV_LOCK.
+        unsafe { std::env::remove_var("PRODDER_CURL_BIN") };
+        let t = CurlTransport::new("tok");
+        assert_eq!(t.bin, "curl");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn curl_transport_honors_env_override() {
+        let _guard = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Safety: guarded by ENV_LOCK.
+        unsafe { std::env::set_var("PRODDER_CURL_BIN", "/opt/curl") };
+        let t = CurlTransport::new("tok");
+        // Safety: guarded by ENV_LOCK.
+        unsafe { std::env::remove_var("PRODDER_CURL_BIN") };
+        assert_eq!(t.bin, "/opt/curl");
+    }
+
+    // ----- public `run` wrapper (exercises CurlTransport construction) -----
+
+    #[cfg(unix)]
+    #[test]
+    fn run_wraps_curl_transport() {
+        let _guard = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let stub = write_stub_script(r#"{"items":[]}"#, 0);
+        // Safety: guarded by ENV_LOCK.
+        unsafe { std::env::set_var("PRODDER_CURL_BIN", &stub) };
+        let res = run("tok");
+        // Safety: guarded by ENV_LOCK.
+        unsafe { std::env::remove_var("PRODDER_CURL_BIN") };
+        assert!(res.is_ok(), "run failed: {res:?}");
+    }
+
+    // ----- curl (subprocess) -----
+
+    #[cfg(unix)]
+    pub static ENV_LOCK: std::sync::Mutex<()> =
+        std::sync::Mutex::new(());
+
+    #[cfg(unix)]
+    fn uniq() -> u64 {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static N: AtomicU64 = AtomicU64::new(0);
+        N.fetch_add(1, Ordering::Relaxed)
+    }
+
+    /// Write a shell script that drains stdin and emits a fixed body.
+    /// Returns the absolute path of the script (executable).
+    #[cfg(unix)]
+    pub fn write_stub_script(body: &str, exit: i32) -> String {
+        use std::io::Write as _;
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = std::env::temp_dir();
+        let stem =
+            format!("prodder_stub_{}_{}", std::process::id(), uniq());
+        let body_path = dir.join(format!("{stem}.body"));
+        std::fs::write(&body_path, body).unwrap();
+        let script_path = dir.join(format!("{stem}.sh"));
+        let script = format!(
+            "#!/bin/sh\ncat > /dev/null\ncat {body_path:?}\nexit {exit}\n"
+        );
+        let mut f = std::fs::File::create(&script_path).unwrap();
+        f.write_all(script.as_bytes()).unwrap();
+        let mut perms = f.metadata().unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&script_path, perms).unwrap();
+        script_path.to_string_lossy().into_owned()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn curl_get_returns_stub_body() {
+        let stub = write_stub_script("hello", 0);
+        let out =
+            curl(&stub, "tok", "GET", "https://x/y", None).unwrap();
+        assert_eq!(out, b"hello");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn curl_post_with_body_returns_stub_body() {
+        let stub = write_stub_script("pong", 0);
+        let out = curl(
+            &stub,
+            "tok",
+            "POST",
+            "https://x/y",
+            Some(b"{\"a\":1}"),
+        )
+        .unwrap();
+        assert_eq!(out, b"pong");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn curl_reports_failure_exit_code() {
+        let stub = write_stub_script("err", 1);
+        let err =
+            curl(&stub, "tok", "GET", "https://x", None).unwrap_err();
+        assert!(err.to_string().contains("curl failed"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn curl_rejects_non_utf8_body() {
+        let stub = write_stub_script("unused", 0);
+        let err = curl(
+            &stub,
+            "tok",
+            "POST",
+            "https://x",
+            Some(&[0xFF, 0xFE]),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("non-utf8"));
+    }
+
+    #[test]
+    fn curl_fails_to_spawn_missing_binary() {
+        let err = curl(
+            "/nonexistent/prodder-curl-stub",
+            "tok",
+            "GET",
+            "https://x",
+            None,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("spawning curl"));
     }
 }
