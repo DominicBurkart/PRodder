@@ -9,12 +9,12 @@ PR lifecycle management that demotes failing open PRs to drafts.
 
 ## Use-case
 
-> For projects requiring human review, preserve human attention by demoting open PRs that don't pass repo merge requirements to drafts.
+For projects requiring human review, preserve human attention by demoting open PRs that don't pass repo merge requirements to drafts.
 
 ## Quickstart
 
 ```sh
-git clone https://github.com/DominicBurkart/PRodder/ && cd prodder && GH_KEY= cargo run
+git clone https://github.com/DominicBurkart/PRodder/ && cd PRodder && GH_KEY=[classic PAT with repo write] cargo run
 ```
 
 ## Type: Job
