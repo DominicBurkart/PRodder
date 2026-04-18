@@ -435,7 +435,7 @@ fn curl(
     if !resp.status().is_success() {
         let status = resp.status();
         let text = resp.text().unwrap_or_default();
-        bail!("request failed ({}): {}", status, text);
+        bail!("request failed ({status}): {text}");
     }
     Ok(resp.bytes().context("reading response body")?.to_vec())
 }

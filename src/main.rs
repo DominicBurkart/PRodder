@@ -1,3 +1,9 @@
+// `reqwest`'s transitive dependency tree pulls in multiple versions of a
+// few common crates (e.g. `core-foundation`, `getrandom`, `hashbrown`,
+// `windows-sys`, `wit-bindgen`). These are outside our control until the
+// upstream crates align, so silence the cargo lint at the crate root.
+#![allow(clippy::multiple_crate_versions)]
+
 use std::env;
 
 use tracing_subscriber::FmtSubscriber;
