@@ -2,6 +2,12 @@
 name = "prodder"
 version = "0.1.0"
 edition = "2024"
+description = "Automatically manages GitHub PR draft status and branch updates based on CI state"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/DominicBurkart/PRodder"
+readme = "README.md"
+keywords = ["github", "pull-request", "ci", "automation"]
+categories = ["command-line-utilities", "development-tools"]
 
 [dependencies]
 anyhow = "1.0.96"
