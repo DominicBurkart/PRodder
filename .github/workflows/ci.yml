@@ -87,8 +87,6 @@ jobs:
           - target: wasm32-unknown-unknown
             runner: ubuntu-latest
             use_cross: false
-            continue_on_error: true
-    continue-on-error: ${{ matrix.continue_on_error == true }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@master

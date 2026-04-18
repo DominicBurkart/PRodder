@@ -9,14 +9,9 @@
 //!
 //! Review-related gating is deliberately ignored — humans handle reviews.
 //!
-//! Implementation note: to keep the supply-chain surface small, this
-//! module has no HTTP client dependency. It shells out to `curl` and
-//! parses the responses with `serde_json::Value`. The GitHub API token
-//! is piped into `curl` via a config file on stdin — it is never passed
-//! on the command line, so it never appears in `/proc/<pid>/cmdline`.
-
-use std::io::Write;
-use std::process::{Command, Stdio};
+//! Implementation note: HTTP requests are made via the `reqwest` blocking
+//! client. The GitHub API token is passed as a bearer token in the
+//! Authorization header and is never exposed on the command line.
 
 use anyhow::{Context, bail};
 use serde_json::Value;
@@ -423,87 +418,31 @@ fn update_branch(
     Ok(())
 }
 
-/// Invoke `curl` against the GitHub API.
-///
-/// The bearer token is piped in via a curl config file on stdin so it
-/// never appears in argv / `/proc/<pid>/cmdline`. Request bodies are
-/// likewise placed in the config as `data-binary = "..."` with
-/// backslash escapes for `\` and `"`.
 fn curl(
     token: &str,
     method: &str,
     url: &str,
     body: Option<&[u8]>,
 ) -> anyhow::Result<Vec<u8>> {
-    let mut config = String::new();
-    config.push_str(&format!(
-        "header = \"Authorization: Bearer {}\"\n",
-        cfg_escape(token)
-    ));
-    config.push_str(
-        "header = \"Accept: application/vnd.github+json\"\n",
-    );
-    config
-        .push_str("header = \"X-GitHub-Api-Version: 2022-11-28\"\n");
-    config.push_str(&format!("user-agent = \"{USER_AGENT}\"\n"));
-    config
-        .push_str(&format!("request = \"{}\"\n", cfg_escape(method)));
-    config.push_str(&format!("url = \"{}\"\n", cfg_escape(url)));
+    let client = reqwest::blocking::Client::new();
+    let mut req = client
+        .request(method.parse().context("invalid HTTP method")?, url)
+        .bearer_auth(token)
+        .header("Accept", "application/vnd.github+json")
+        .header("X-GitHub-Api-Version", "2022-11-28")
+        .header("User-Agent", USER_AGENT);
     if let Some(b) = body {
-        let body_str = std::str::from_utf8(b)
-            .context("non-utf8 request body")?;
-        config.push_str(
-            "header = \"Content-Type: application/json\"\n",
-        );
-        config.push_str(&format!(
-            "data-binary = \"{}\"\n",
-            cfg_escape(body_str)
-        ));
+        req = req
+            .header("Content-Type", "application/json")
+            .body(b.to_vec());
     }
-
-    let mut child = Command::new("curl")
-        .args([
-            "--silent",
-            "--show-error",
-            "--fail-with-body",
-            "--location",
-            "--config",
-            "-",
-        ])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .context("spawning curl")?;
-    child
-        .stdin
-        .as_mut()
-        .expect("stdin piped")
-        .write_all(config.as_bytes())
-        .context("writing curl config")?;
-    let out = child.wait_with_output().context("waiting for curl")?;
-    if !out.status.success() {
-        bail!(
-            "curl failed ({}): {}",
-            out.status,
-            String::from_utf8_lossy(&out.stderr)
-        );
+    let resp = req.send().context("sending request")?;
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let text = resp.text().unwrap_or_default();
+        bail!("request failed ({}): {}", status, text);
     }
-    Ok(out.stdout)
-}
-
-/// Escape a string for use inside a `"..."` value in a curl config
-/// file. Only `\` and `"` need escaping.
-fn cfg_escape(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for c in s.chars() {
-        match c {
-            '\\' => out.push_str("\\\\"),
-            '"' => out.push_str("\\\""),
-            _ => out.push(c),
-        }
-    }
-    out
+    Ok(resp.bytes().context("reading response body")?.to_vec())
 }
 
 /// Percent-encode a query-parameter value using the unreserved set
@@ -690,19 +629,6 @@ mod tests {
         assert_eq!(
             percent_encode("is:open is:pr author:DominicBurkart"),
             "is%3Aopen%20is%3Apr%20author%3ADominicBurkart"
-        );
-    }
-
-    #[test]
-    fn cfg_escape_quotes_and_backslashes() {
-        assert_eq!(cfg_escape(r#"a"b\c"#), r#"a\"b\\c"#);
-    }
-
-    #[test]
-    fn cfg_escape_plain_string_unchanged() {
-        assert_eq!(
-            cfg_escape("Bearer ghp_abc123"),
-            "Bearer ghp_abc123"
         );
     }
 }
