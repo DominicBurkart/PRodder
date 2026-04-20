@@ -4,3 +4,7 @@ coverage:
     patch:
       default:
         target: 100%
+  ignore:
+    # Wasm-only stubs cannot be exercised by `cargo test` on a native
+    # target. Browser/WASI runtime parity is tracked in #19.
+    - "src/wasm.rs"

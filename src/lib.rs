@@ -4,9 +4,13 @@
 #[cfg(not(target_arch = "wasm32"))]
 use std::env;
 
+#[cfg(not(target_arch = "wasm32"))]
 use tracing_subscriber::FmtSubscriber;
 
 pub mod drafter;
+
+#[cfg(target_arch = "wasm32")]
+mod wasm;
 
 /// Binary entry point. Initializes tracing, reads the token from the
 /// environment (and removes it to avoid leaking into child processes
@@ -22,18 +26,12 @@ pub async fn real_main() -> anyhow::Result<()> {
 
 #[cfg(not(target_arch = "wasm32"))]
 async fn run_drafter(token: String) -> anyhow::Result<()> {
-    tokio::task::spawn_blocking(move || drafter::run(&token))
-        .await
-        .map_err(|e| {
-            anyhow::anyhow!("drafter task join error: {e}")
-        })?
+    tokio::task::spawn_blocking(move || drafter::run(&token)).await?
 }
 
 #[cfg(target_arch = "wasm32")]
-async fn run_drafter(_token: String) -> anyhow::Result<()> {
-    Err(anyhow::anyhow!(
-        "drafter execution on wasm32 not implemented; see #19"
-    ))
+async fn run_drafter(token: String) -> anyhow::Result<()> {
+    wasm::run_drafter(token).await
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -49,10 +47,7 @@ fn init_tracing() {
 
 #[cfg(target_arch = "wasm32")]
 fn init_tracing() {
-    let subscriber = FmtSubscriber::builder()
-        .with_max_level(max_level())
-        .finish();
-    let _ = tracing::subscriber::set_global_default(subscriber);
+    wasm::init_tracing(max_level());
 }
 
 #[cfg(debug_assertions)]
@@ -77,9 +72,7 @@ fn read_token() -> anyhow::Result<String> {
 
 #[cfg(target_arch = "wasm32")]
 fn read_token() -> anyhow::Result<String> {
-    Err(anyhow::anyhow!(
-        "GH_TOKEN provisioning not implemented for wasm; see #19"
-    ))
+    wasm::read_token()
 }
 
 #[cfg(all(test, not(target_arch = "wasm32")))]
