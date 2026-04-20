@@ -19,6 +19,9 @@
 
         src = craneLib.cleanCargoSource (craneLib.path ./.);
 
+        # Stage 1 (build env): full rust toolchain + build deps.
+        # crane isolates the cargo dependency build from the crate build,
+        # so dependency compilation is cached independently of source changes.
         commonArgs = {
           inherit src;
           strictDeps = true;
@@ -31,6 +34,7 @@
           pname = "prodder-deps";
         });
 
+        # Release-profile binary: LTO, stripped, abort-on-panic, opt-for-size.
         prodder = craneLib.buildPackage (commonArgs // {
           inherit cargoArtifacts;
           pname = "prodder";
@@ -41,28 +45,60 @@
           CARGO_PROFILE_RELEASE_OPT_LEVEL = "s";
         });
 
-        container = pkgs.dockerTools.buildLayeredImage {
-          name = "prodder";
-          tag = "latest";
+        # Stage 2 (runtime env): distroless OCI image built with nix's
+        # dockerTools. Contains only the closure of:
+        #   * the stripped prodder binary
+        #   * cacert (TLS trust store)
+        #   * curl (transitively required by drafter.rs; will be dropped
+        #     once PR #7 lands and reqwest replaces the curl subprocess)
+        # There is no shell, no package manager, no coreutils, no busybox.
+        # This is functionally equivalent to gcr.io/distroless/cc-debian.
+        #
+        # buildLayeredImage produces a podman-compatible OCI image.
+        # streamLayeredImage produces a script that streams the image to
+        # stdout, which is more memory-efficient for large images and
+        # can be piped directly into `podman load`.
+        containerName = "prodder";
+        containerTag = "latest";
 
-          contents = with pkgs; [
-            cacert
-            curl
+        containerContents = with pkgs; [
+          cacert
+          curl
+        ];
+
+        containerConfig = {
+          Cmd = [ "${prodder}/bin/prodder" ];
+          Env = [
+            "SSL_CERT_FILE=${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt"
+            "PATH=${prodder}/bin:${pkgs.curl}/bin"
           ];
-
-          config = {
-            Cmd = [ "${prodder}/bin/prodder" ];
-            Env = [
-              "SSL_CERT_FILE=${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt"
-              "PATH=/bin:/usr/bin:${prodder}/bin:${pkgs.curl}/bin"
-            ];
+          Labels = {
+            "org.opencontainers.image.source" =
+              "https://github.com/DominicBurkart/PRodder";
+            "org.opencontainers.image.description" =
+              "PRodder - automated PR draft management (distroless)";
+            "org.opencontainers.image.licenses" = "MIT OR Apache-2.0";
           };
+        };
+
+        container = pkgs.dockerTools.buildLayeredImage {
+          name = containerName;
+          tag = containerTag;
+          contents = containerContents;
+          config = containerConfig;
+        };
+
+        containerStream = pkgs.dockerTools.streamLayeredImage {
+          name = containerName;
+          tag = containerTag;
+          contents = containerContents;
+          config = containerConfig;
         };
 
       in
       {
         packages = {
-          inherit prodder container;
+          inherit prodder container containerStream;
           default = container;
         };
 
