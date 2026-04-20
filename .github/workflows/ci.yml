@@ -88,6 +88,10 @@ jobs:
             runner: ubuntu-latest
             use_cross: false
             continue_on_error: true
+          - target: wasm32-wasip1
+            runner: ubuntu-latest
+            use_cross: false
+            continue_on_error: true
     continue-on-error: ${{ matrix.continue_on_error == true }}
     steps:
       - uses: actions/checkout@v4
@@ -99,12 +103,15 @@ jobs:
         if: matrix.use_cross
         with:
           tool: cross
-      - name: Build (cross)
+      - name: Build / check (cross)
         if: matrix.use_cross
         run: cross build --target ${{ matrix.target }}
-      - name: Build (native)
-        if: "!matrix.use_cross"
+      - name: Build (native, non-wasm)
+        if: "!matrix.use_cross && !startsWith(matrix.target, 'wasm32-')"
         run: cargo build --target ${{ matrix.target }}
+      - name: Check (wasm)
+        if: "!matrix.use_cross && startsWith(matrix.target, 'wasm32-')"
+        run: cargo check --target ${{ matrix.target }}
 
   container:
     name: Container Build
