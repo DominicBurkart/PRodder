@@ -24,7 +24,9 @@ pub async fn real_main() -> anyhow::Result<()> {
 async fn run_drafter(token: String) -> anyhow::Result<()> {
     tokio::task::spawn_blocking(move || drafter::run(&token))
         .await
-        .map_err(|e| anyhow::anyhow!("drafter task join error: {e}"))?
+        .map_err(|e| {
+            anyhow::anyhow!("drafter task join error: {e}")
+        })?
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -129,6 +131,12 @@ mod tests {
         assert!(env::var("GH_TOKEN").is_err());
     }
 
+    // Held across an `.await` on purpose: the lock serialises
+    // process-wide env-var mutation, and the call under test reads those
+    // env vars, so the lock must cover the entire `real_main` future.
+    // The runtime is `current_thread`, so there is no cross-thread
+    // contention on the std `Mutex`.
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn real_main_errors_without_token() {
         let _guard = ENV_LOCK
@@ -139,6 +147,9 @@ mod tests {
         assert!(real_main().await.is_err());
     }
 
+    // See comment on `real_main_errors_without_token` re:
+    // `await_holding_lock` — same rationale.
+    #[allow(clippy::await_holding_lock)]
     #[cfg(unix)]
     #[tokio::test]
     async fn real_main_runs_with_stubbed_curl() {
