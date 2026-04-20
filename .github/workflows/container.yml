@@ -1,0 +1,63 @@
+name: container (nix)
+
+# Builds the nix-based OCI container and exercises scripts/smoke.sh.
+# Distinct from the Dockerfile-based container job in PR #5's CI pipeline:
+#   * that job: `podman build` the Dockerfile and run container_checks.sh
+#   * this job: `nix build .#container`, podman-load, run scripts/smoke.sh
+# Once the maintainer decides which route wins, the losing job can be
+# dropped. Both jobs share the same smoke-test asserts via scripts/smoke.sh.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    paths:
+      - 'flake.nix'
+      - 'flake.lock'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'rust-toolchain.toml'
+      - 'src/**'
+      - 'scripts/smoke.sh'
+      - 'container_checks.sh'
+      - '.github/workflows/container.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: container-nix-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  nix-container:
+    name: nix build + podman smoke test
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install nix (with flakes)
+        uses: cachix/install-nix-action@v27
+        with:
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+            accept-flake-config = true
+
+      - name: Cache /nix/store via magic-nix-cache
+        uses: DeterminateSystems/magic-nix-cache-action@main
+
+      - name: Install podman
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y podman
+
+      - name: nix build .#container
+        run: nix build --print-build-logs .#container
+
+      - name: podman load
+        run: podman load <"$(readlink -f result)"
+
+      - name: Run smoke test
+        run: ./scripts/smoke.sh --no-build
+
+      - name: Show image size
+        run: podman image inspect prodder:latest --format '{{.Size}} bytes'
