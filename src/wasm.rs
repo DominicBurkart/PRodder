@@ -8,16 +8,17 @@
 
 use tracing_subscriber::FmtSubscriber;
 
-pub(crate) async fn run_drafter(_token: String) -> anyhow::Result<()> {
+pub(crate) async fn run_drafter(
+    _token: String,
+) -> anyhow::Result<()> {
     Err(anyhow::anyhow!(
         "drafter execution on wasm32 not implemented; see #19"
     ))
 }
 
 pub(crate) fn init_tracing(level: tracing::Level) {
-    let subscriber = FmtSubscriber::builder()
-        .with_max_level(level)
-        .finish();
+    let subscriber =
+        FmtSubscriber::builder().with_max_level(level).finish();
     let _ = tracing::subscriber::set_global_default(subscriber);
 }
 

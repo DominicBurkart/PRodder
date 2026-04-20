@@ -26,7 +26,11 @@ pub async fn real_main() -> anyhow::Result<()> {
 
 #[cfg(not(target_arch = "wasm32"))]
 async fn run_drafter(token: String) -> anyhow::Result<()> {
-    tokio::task::spawn_blocking(move || drafter::run(&token)).await?
+    tokio::task::spawn_blocking(move || drafter::run(&token))
+        .await
+        .map_err(|e| {
+            anyhow::anyhow!("drafter task join error: {e}")
+        })?
 }
 
 #[cfg(target_arch = "wasm32")]
