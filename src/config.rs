@@ -31,18 +31,38 @@ pub struct Config {
 
 /// Who to target.
 ///
-/// * `List(vec![])` — the default — means "derive from the PAT".
+/// * `List(vec![])` means "derive from the PAT" — the PAT owner's
+///   login is resolved via `GET /user` at runtime.
 /// * `List(vec!["*".into()])` means "all users visible to the token".
 /// * Any other list is an explicit allow-list.
-#[derive(
-    Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize,
-)]
+///
+/// The [`Default`] for this type is `["dependabot[bot]"]` so that out
+/// of the box PRodder watches dependabot's automated PRs — a common
+/// case in any repository that has dependabot enabled. Operators who
+/// want the historical "PAT owner only" behaviour set `users = []`
+/// explicitly; operators who want dependabot *and* the PAT owner set
+/// `users = ["dependabot[bot]", "<their-login>"]`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct Users(pub Vec<String>);
 
+/// Login of the dependabot GitHub App as it appears on PR author
+/// fields. Kept as a named constant so tests and documentation agree
+/// on the exact string (GitHub brackets bot logins with `[bot]`).
+pub const DEPENDABOT_LOGIN: &str = "dependabot[bot]";
+
+impl Default for Users {
+    fn default() -> Self {
+        Self(vec![DEPENDABOT_LOGIN.to_string()])
+    }
+}
+
 impl Users {
-    /// Return true when no explicit users were configured.
-    pub fn is_default(&self) -> bool {
+    /// Return true when the list is empty, i.e. the caller wants the
+    /// PAT owner resolved from `GET /user`. This is **not** the same
+    /// as [`Users::default`] — the default is
+    /// `["dependabot[bot]"]`, an explicit non-empty list.
+    pub fn is_empty(&self) -> bool {
         self.0.is_empty()
     }
 
@@ -61,7 +81,7 @@ impl Users {
     /// caller is expected to translate the wildcard into a
     /// GitHub-search query (e.g. by omitting the `author:` clause).
     pub fn resolve(&self, pat: &str) -> anyhow::Result<Vec<String>> {
-        if !self.is_default() {
+        if !self.is_empty() {
             return Ok(self.0.clone());
         }
         let login = fetch_authenticated_login(pat)
@@ -200,12 +220,39 @@ mod tests {
     fn users_wildcard_distinct_from_explicit() {
         let star = Users(vec!["*".into()]);
         let explicit = Users(vec!["octocat".into()]);
-        let empty = Users::default();
+        let empty = Users(vec![]);
         assert!(star.is_wildcard());
         assert!(!explicit.is_wildcard());
-        assert!(empty.is_default());
-        assert!(!star.is_default());
+        assert!(empty.is_empty());
+        assert!(!star.is_empty());
         assert_ne!(star, explicit);
+    }
+
+    #[test]
+    fn default_users_includes_dependabot() {
+        // Issue #23: dependabot should be watched out of the box.
+        let users = Users::default();
+        assert!(
+            users.0.iter().any(|u| u == DEPENDABOT_LOGIN),
+            "Users::default() should include {DEPENDABOT_LOGIN}; \
+             got {:?}",
+            users.0,
+        );
+        // And the default is *not* the "empty → derive from PAT"
+        // sentinel — that is a distinct, explicit operator choice.
+        assert!(!users.is_empty());
+    }
+
+    #[test]
+    fn default_users_renders_filter_with_dependabot_author() {
+        // End-to-end: the default config should surface dependabot
+        // as an `author:` clause in the search query.
+        let cfg = Config::default();
+        let rendered = cfg.filter.render(&cfg.users.0);
+        assert!(
+            rendered.contains(&format!("author:{DEPENDABOT_LOGIN}")),
+            "default filter should target dependabot; got {rendered:?}",
+        );
     }
 
     #[test]
