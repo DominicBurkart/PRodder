@@ -11,16 +11,22 @@
 
 # GitHub logins PRodder should watch.
 #
-# * Empty (the default) — PRodder will call `GET /user` with the
-#   provided PAT and target whichever login owns the token.
+# * `["dependabot[bot]"]` (the default) — watch dependabot's
+#   automated PRs, which benefit the most from PRodder's demote-on-
+#   failure + auto-update-branch loop. Issue #23.
+# * `[]` — empty; PRodder will call `GET /user` with the provided
+#   PAT and target whichever login owns the token. Use this when
+#   dependabot is not enabled on the target repositories.
 # * `["*"]` — wildcard; matches any author the token can see. The
 #   default filter omits `author:` in this mode.
 # * An explicit list — only PRs authored by these logins are
-#   considered.
+#   considered. Combine with dependabot explicitly if desired, e.g.
+#   `["dependabot[bot]", "octocat"]`.
 #
-# GitHub REST reference:
+# GitHub REST references:
 # https://docs.github.com/en/rest/users/users#get-the-authenticated-user
-users = []
+# https://docs.github.com/en/code-security/dependabot
+users = ["dependabot[bot]"]
 
 # Filter passed to GitHub's issue search API. Accepts the same
 # syntax as the search bar at https://github.com/pulls. An empty
