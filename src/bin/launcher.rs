@@ -1,8 +1,9 @@
 use std::process::{Command, Stdio};
 
 fn main() -> std::io::Result<()> {
-    let mut p =
-        Command::new("prodder").stdout(Stdio::piped()).spawn()?;
+    let mut p = Command::new("prodder")
+        .stdout(Stdio::piped())
+        .spawn()?;
 
     match std::env::var("DATADOG_API_KEY") {
         Ok(_) => {
