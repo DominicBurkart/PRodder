@@ -178,6 +178,15 @@ pub fn run(token: &str) -> anyhow::Result<()> {
 }
 
 fn run_with(t: &dyn Transport) {
+    let skip_names: Vec<String> =
+        std::env::var("PRODDER_SKIP_CHECK_NAMES")
+            .unwrap_or_default()
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(String::from)
+            .collect();
+
     let candidates = match list_candidate_prs(t) {
         Ok(v) => v,
         Err(e) => {
@@ -191,7 +200,7 @@ fn run_with(t: &dyn Transport) {
     );
 
     for c in candidates {
-        let action = match evaluate(t, &c) {
+        let action = match evaluate(t, &c, &skip_names) {
             Ok(a) => a,
             Err(e) => {
                 warn!(owner = %c.owner, repo = %c.repo, number = c.number, "drafter: failed to evaluate PR: {e:#}");
@@ -324,6 +333,7 @@ fn list_candidate_prs(
 fn evaluate(
     t: &dyn Transport,
     c: &CandidatePr,
+    skip_names: &[String],
 ) -> anyhow::Result<Action> {
     let pr_url = format!(
         "{API}/repos/{}/{}/pulls/{}",
@@ -386,6 +396,10 @@ fn evaluate(
                     .map(String::from),
             });
         }
+    }
+    if !skip_names.is_empty() {
+        checks
+            .retain(|run| !skip_names.iter().any(|n| n == &run.name));
     }
 
     Ok(decide(
@@ -928,7 +942,7 @@ pub(crate) mod tests {
             .queue_ok(br#"{"state":"success"}"#)
             .queue_ok(br#"{"check_runs":[]}"#);
         assert_eq!(
-            evaluate(&t, &candidate()).unwrap(),
+            evaluate(&t, &candidate(), &[]).unwrap(),
             Action::Nothing
         );
     }
@@ -940,7 +954,7 @@ pub(crate) mod tests {
             .queue_ok(br#"{"state":"success"}"#)
             .queue_ok(br#"{"check_runs":[{"name":"ci","status":"completed","conclusion":"success"}]}"#);
         assert_eq!(
-            evaluate(&t, &candidate()).unwrap(),
+            evaluate(&t, &candidate(), &[]).unwrap(),
             Action::UpdateBranch
         );
     }
@@ -953,7 +967,38 @@ pub(crate) mod tests {
             .queue_ok(
                 br#"{"check_runs":[{"name":"ci","status":"completed","conclusion":"failure"}]}"#,
             );
-        let got = evaluate(&t, &candidate()).unwrap();
+        let got = evaluate(&t, &candidate(), &[]).unwrap();
+        assert!(matches!(got, Action::Draft(_)));
+    }
+
+    #[test]
+    fn evaluate_skips_named_failing_check() {
+        let t = MockTransport::new()
+            .queue_ok(&pr_ok())
+            .queue_ok(br#"{"state":"success"}"#)
+            .queue_ok(
+                br#"{"check_runs":[{"name":"Benches","status":"completed","conclusion":"failure"}]}"#,
+            );
+        let skip = vec!["Benches".to_string()];
+        assert_eq!(
+            evaluate(&t, &candidate(), &skip).unwrap(),
+            Action::Nothing
+        );
+    }
+
+    #[test]
+    fn evaluate_only_skips_listed_checks() {
+        let t = MockTransport::new()
+            .queue_ok(&pr_ok())
+            .queue_ok(br#"{"state":"success"}"#)
+            .queue_ok(
+                br#"{"check_runs":[
+                    {"name":"Benches","status":"completed","conclusion":"failure"},
+                    {"name":"ci","status":"completed","conclusion":"failure"}
+                ]}"#,
+            );
+        let skip = vec!["Benches".to_string()];
+        let got = evaluate(&t, &candidate(), &skip).unwrap();
         assert!(matches!(got, Action::Draft(_)));
     }
 
@@ -964,7 +1009,7 @@ pub(crate) mod tests {
             .queue_ok(br#"{"state":"success"}"#)
             .queue_ok(b"{}");
         assert_eq!(
-            evaluate(&t, &candidate()).unwrap(),
+            evaluate(&t, &candidate(), &[]).unwrap(),
             Action::Nothing
         );
     }
@@ -978,7 +1023,7 @@ pub(crate) mod tests {
             .queue_ok(br#"{"state":"pending"}"#)
             .queue_ok(br#"{"check_runs":[]}"#);
         assert_eq!(
-            evaluate(&t, &candidate()).unwrap(),
+            evaluate(&t, &candidate(), &[]).unwrap(),
             Action::Retry
         );
     }
@@ -986,7 +1031,7 @@ pub(crate) mod tests {
     #[test]
     fn evaluate_bubbles_pr_fetch_error() {
         let t = MockTransport::new().queue_err("pr boom");
-        assert!(evaluate(&t, &candidate()).is_err());
+        assert!(evaluate(&t, &candidate(), &[]).is_err());
     }
 
     #[test]
@@ -994,7 +1039,7 @@ pub(crate) mod tests {
         let t = MockTransport::new()
             .queue_ok(&pr_ok())
             .queue_err("status boom");
-        assert!(evaluate(&t, &candidate()).is_err());
+        assert!(evaluate(&t, &candidate(), &[]).is_err());
     }
 
     #[test]
@@ -1003,13 +1048,13 @@ pub(crate) mod tests {
             .queue_ok(&pr_ok())
             .queue_ok(br#"{"state":"success"}"#)
             .queue_err("checks boom");
-        assert!(evaluate(&t, &candidate()).is_err());
+        assert!(evaluate(&t, &candidate(), &[]).is_err());
     }
 
     #[test]
     fn evaluate_bubbles_pr_parse_error() {
         let t = MockTransport::new().queue_ok(b"{not json");
-        assert!(evaluate(&t, &candidate()).is_err());
+        assert!(evaluate(&t, &candidate(), &[]).is_err());
     }
 
     #[test]
@@ -1017,7 +1062,7 @@ pub(crate) mod tests {
         let t = MockTransport::new()
             .queue_ok(&pr_ok())
             .queue_ok(b"{not json");
-        assert!(evaluate(&t, &candidate()).is_err());
+        assert!(evaluate(&t, &candidate(), &[]).is_err());
     }
 
     #[test]
@@ -1026,7 +1071,7 @@ pub(crate) mod tests {
             .queue_ok(&pr_ok())
             .queue_ok(br#"{"state":"success"}"#)
             .queue_ok(b"{not json");
-        assert!(evaluate(&t, &candidate()).is_err());
+        assert!(evaluate(&t, &candidate(), &[]).is_err());
     }
 
     // ----- convert_to_draft -----
