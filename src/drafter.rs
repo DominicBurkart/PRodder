@@ -1,6 +1,6 @@
-//! Finds all open PRs (including drafts) authored by `DominicBurkart`
-//! in `DominicBurkart/*` repos, checks non-review merge requirements
-//! (merge conflicts, combined status, check-runs), and either:
+//! Finds open PRs in `DominicBurkart/*` repos authored by an allowlisted
+//! set of accounts, checks non-review merge requirements (merge
+//! conflicts, combined status, check-runs), and either:
 //!   * converts any non-draft PR with a blocking non-review requirement
 //!     back to draft state, or
 //!   * for PRs whose branch is behind the base
@@ -8,6 +8,12 @@
 //!     so it stays current.
 //!
 //! Review-related gating is deliberately ignored — humans handle reviews.
+//!
+//! The author allowlist is configured via the `PRODDER_AUTHORS`
+//! environment variable (comma-separated), defaulting to
+//! `DominicBurkart`. Trusted-bot accounts can be added (e.g.
+//! `PRODDER_AUTHORS=DominicBurkart,app/dependabot`) so their PRs also
+//! get branch-updates and draft-demotion.
 //!
 //! Implementation note: to keep the supply-chain surface small, this
 //! module has no HTTP client dependency. It shells out to `curl` and
@@ -22,9 +28,10 @@ use anyhow::{Context, bail};
 use serde_json::Value;
 use tracing::{info, warn};
 
-const SEARCH_QUERY: &str =
-    "is:open is:pr author:DominicBurkart archived:false";
 const OWNER_PREFIX: &str = "DominicBurkart/";
+const SEARCH_USER: &str = "DominicBurkart";
+const AUTHORS_ENV: &str = "PRODDER_AUTHORS";
+const DEFAULT_AUTHOR: &str = "DominicBurkart";
 const API: &str = "https://api.github.com";
 const USER_AGENT: &str = "PRodder";
 
@@ -227,12 +234,42 @@ fn run_with(t: &dyn Transport) {
     }
 }
 
+fn parse_authors(raw: &str) -> Vec<String> {
+    let parsed: Vec<String> = raw
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect();
+    if parsed.is_empty() {
+        vec![DEFAULT_AUTHOR.to_string()]
+    } else {
+        parsed
+    }
+}
+
+fn search_authors_from_env() -> Vec<String> {
+    parse_authors(&std::env::var(AUTHORS_ENV).unwrap_or_default())
+}
+
+fn build_search_query(authors: &[String]) -> String {
+    let mut q =
+        format!("is:open is:pr archived:false user:{SEARCH_USER}");
+    for a in authors {
+        q.push_str(" author:");
+        q.push_str(a);
+    }
+    q
+}
+
 fn list_candidate_prs(
     t: &dyn Transport,
 ) -> anyhow::Result<Vec<CandidatePr>> {
+    let authors = search_authors_from_env();
+    let query = build_search_query(&authors);
     let url = format!(
         "{API}/search/issues?q={}&per_page=100",
-        percent_encode(SEARCH_QUERY)
+        percent_encode(&query)
     );
     let body =
         t.request("GET", &url, None).context("search issues")?;
@@ -799,6 +836,66 @@ pub(crate) mod tests {
         assert_eq!(
             percent_encode("is:open is:pr author:DominicBurkart"),
             "is%3Aopen%20is%3Apr%20author%3ADominicBurkart"
+        );
+    }
+
+    #[test]
+    fn build_search_query_default_uses_dominicburkart_only() {
+        let authors = vec!["DominicBurkart".to_string()];
+        assert_eq!(
+            build_search_query(&authors),
+            "is:open is:pr archived:false user:DominicBurkart \
+             author:DominicBurkart"
+        );
+    }
+
+    #[test]
+    fn build_search_query_includes_all_authors() {
+        let authors = vec![
+            "DominicBurkart".to_string(),
+            "app/dependabot".to_string(),
+        ];
+        assert_eq!(
+            build_search_query(&authors),
+            "is:open is:pr archived:false user:DominicBurkart \
+             author:DominicBurkart author:app/dependabot"
+        );
+    }
+
+    #[test]
+    fn build_search_query_emits_repo_owner_scope() {
+        // user: qualifier scopes search to the configured owner so a
+        // bot account with thousands of unrelated PRs across GitHub
+        // doesn't crowd out the first 100 results.
+        assert!(
+            build_search_query(&["app/dependabot".to_string()])
+                .contains("user:DominicBurkart")
+        );
+    }
+
+    #[test]
+    fn parse_authors_empty_falls_back_to_default() {
+        assert_eq!(parse_authors(""), vec!["DominicBurkart"]);
+    }
+
+    #[test]
+    fn parse_authors_whitespace_only_falls_back_to_default() {
+        assert_eq!(parse_authors("  ,  ,"), vec!["DominicBurkart"]);
+    }
+
+    #[test]
+    fn parse_authors_trims_and_splits() {
+        assert_eq!(
+            parse_authors(" DominicBurkart , app/dependabot "),
+            vec!["DominicBurkart", "app/dependabot"]
+        );
+    }
+
+    #[test]
+    fn parse_authors_drops_empty_segments() {
+        assert_eq!(
+            parse_authors("DominicBurkart,,app/dependabot,"),
+            vec!["DominicBurkart", "app/dependabot"]
         );
     }
 
