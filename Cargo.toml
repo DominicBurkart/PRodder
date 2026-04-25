@@ -17,3 +17,12 @@ tracing-subscriber = { version = "0.3", features = ["json"] }
 
 [dev-dependencies]
 cargo-husky = { version = "1", default-features = false, features = ["user-hooks"] }
+
+# `cfg(tarpaulin)` is set by cargo-tarpaulin when it instruments the
+# crate. Registering it here with `check-cfg` silences the unexpected
+# `cfg` lint that is on by default under `-W clippy::pedantic`.
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = [
+    'cfg(tarpaulin)',
+    'cfg(tarpaulin_include)',
+] }
