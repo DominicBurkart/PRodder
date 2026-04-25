@@ -9,7 +9,7 @@ PR lifecycle management that demotes failing open PRs to drafts.
 
 ## Use-case
 
-For projects requiring human review, preserve human attention by demoting open PRs that don't pass repo merge requirements to drafts.
+For projects requiring human review, preserve human attention by demoting open PRs that don't pass repo merge requirements to drafts. [Here's the complete flow PRodder was built as a part of.](https://dominic.computer/blog/2026/routines)
 
 ## Quickstart
 
