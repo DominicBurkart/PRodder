@@ -1,3 +1,8 @@
+// Match the crate root's allow — the launcher binary doesn't depend on
+// reqwest directly, but cargo treats it as part of the same workspace
+// crate-graph for the lint.
+#![allow(clippy::multiple_crate_versions)]
+
 use std::process::{Command, Stdio};
 
 fn main() -> std::io::Result<()> {

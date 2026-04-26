@@ -9,14 +9,10 @@
 //!
 //! Review-related gating is deliberately ignored — humans handle reviews.
 //!
-//! Implementation note: to keep the supply-chain surface small, this
-//! module has no HTTP client dependency. It shells out to `curl` and
-//! parses the responses with `serde_json::Value`. The GitHub API token
-//! is piped into `curl` via a config file on stdin — it is never passed
-//! on the command line, so it never appears in `/proc/<pid>/cmdline`.
-
-use std::io::Write;
-use std::process::{Command, Stdio};
+//! Implementation note: HTTP requests are made via `reqwest`'s blocking
+//! client. The GitHub API token is sent as a bearer token in the
+//! `Authorization` header, so it never appears on a command line and
+//! never reaches `/proc/<pid>/cmdline`.
 
 use anyhow::{Context, bail};
 use serde_json::Value;
@@ -25,8 +21,15 @@ use tracing::{info, warn};
 const SEARCH_QUERY: &str =
     "is:open is:pr author:DominicBurkart archived:false";
 const OWNER_PREFIX: &str = "DominicBurkart/";
-const API: &str = "https://api.github.com";
+const DEFAULT_API: &str = "https://api.github.com";
 const USER_AGENT: &str = "PRodder";
+
+/// Resolve the GitHub API base URL, allowing tests to point at a local
+/// server via `PRODDER_API_BASE`.
+fn api_base() -> String {
+    std::env::var("PRODDER_API_BASE")
+        .unwrap_or_else(|_| DEFAULT_API.to_string())
+}
 
 const CONVERT_TO_DRAFT_MUTATION: &str = "mutation ConvertToDraft($id: ID!) { \
     convertPullRequestToDraft(input: { pullRequestId: $id }) { \
@@ -41,9 +44,9 @@ struct CandidatePr {
     head_sha: String,
 }
 
-/// HTTP transport abstraction. The production impl shells out to `curl`;
-/// tests swap in a mock to exercise the request/response logic without
-/// spawning a subprocess or touching the network.
+/// HTTP transport abstraction. The production impl uses `reqwest`'s
+/// blocking client; tests swap in a mock to exercise the
+/// request/response logic without touching the network.
 pub(crate) trait Transport {
     /// Perform an HTTP request and return the raw response body.
     ///
@@ -58,27 +61,29 @@ pub(crate) trait Transport {
     ) -> anyhow::Result<Vec<u8>>;
 }
 
-struct CurlTransport<'a> {
+struct ReqwestTransport<'a> {
     token: &'a str,
-    bin: String,
+    client: reqwest::blocking::Client,
 }
 
-impl<'a> CurlTransport<'a> {
-    fn new(token: &'a str) -> Self {
-        let bin = std::env::var("PRODDER_CURL_BIN")
-            .unwrap_or_else(|_| "curl".to_string());
-        Self { token, bin }
+impl<'a> ReqwestTransport<'a> {
+    fn new(token: &'a str) -> anyhow::Result<Self> {
+        let client = reqwest::blocking::Client::builder()
+            .user_agent(USER_AGENT)
+            .build()
+            .context("building HTTP client")?;
+        Ok(Self { token, client })
     }
 }
 
-impl Transport for CurlTransport<'_> {
+impl Transport for ReqwestTransport<'_> {
     fn request(
         &self,
         method: &str,
         url: &str,
         body: Option<&[u8]>,
     ) -> anyhow::Result<Vec<u8>> {
-        curl(&self.bin, self.token, method, url, body)
+        send(&self.client, self.token, method, url, body)
     }
 }
 
@@ -172,7 +177,7 @@ fn classify(
 /// parse, and per-PR errors are logged and swallowed so the cycle as a
 /// whole makes best-effort progress.
 pub fn run(token: &str) -> anyhow::Result<()> {
-    let transport = CurlTransport::new(token);
+    let transport = ReqwestTransport::new(token)?;
     run_with(&transport);
     Ok(())
 }
@@ -231,7 +236,8 @@ fn list_candidate_prs(
     t: &dyn Transport,
 ) -> anyhow::Result<Vec<CandidatePr>> {
     let url = format!(
-        "{API}/search/issues?q={}&per_page=100",
+        "{}/search/issues?q={}&per_page=100",
+        api_base(),
         percent_encode(SEARCH_QUERY)
     );
     let body =
@@ -262,8 +268,10 @@ fn list_candidate_prs(
             continue;
         };
 
-        let pr_url =
-            format!("{API}/repos/{owner}/{repo}/pulls/{number}");
+        let pr_url = format!(
+            "{}/repos/{owner}/{repo}/pulls/{number}",
+            api_base()
+        );
         let pr_body = match t.request("GET", &pr_url, None) {
             Ok(b) => b,
             Err(e) => {
@@ -326,8 +334,11 @@ fn evaluate(
     c: &CandidatePr,
 ) -> anyhow::Result<Action> {
     let pr_url = format!(
-        "{API}/repos/{}/{}/pulls/{}",
-        c.owner, c.repo, c.number
+        "{}/repos/{}/{}/pulls/{}",
+        api_base(),
+        c.owner,
+        c.repo,
+        c.number
     );
     let pr_body =
         t.request("GET", &pr_url, None).context("pulls.get")?;
@@ -342,8 +353,11 @@ fn evaluate(
         .to_string();
 
     let status_url = format!(
-        "{API}/repos/{}/{}/commits/{}/status",
-        c.owner, c.repo, c.head_sha
+        "{}/repos/{}/{}/commits/{}/status",
+        api_base(),
+        c.owner,
+        c.repo,
+        c.head_sha
     );
     let status_body = t
         .request("GET", &status_url, None)
@@ -357,8 +371,11 @@ fn evaluate(
         .to_string();
 
     let checks_url = format!(
-        "{API}/repos/{}/{}/commits/{}/check-runs",
-        c.owner, c.repo, c.head_sha
+        "{}/repos/{}/{}/commits/{}/check-runs",
+        api_base(),
+        c.owner,
+        c.repo,
+        c.head_sha
     );
     let checks_body =
         t.request("GET", &checks_url, None).context("check-runs")?;
@@ -406,7 +423,11 @@ fn convert_to_draft(
     });
     let body_bytes = serde_json::to_vec(&body)?;
     let resp_bytes = t
-        .request("POST", &format!("{API}/graphql"), Some(&body_bytes))
+        .request(
+            "POST",
+            &format!("{}/graphql", api_base()),
+            Some(&body_bytes),
+        )
         .context("graphql convertPullRequestToDraft")?;
     let resp: Value = serde_json::from_slice(&resp_bytes)
         .context("parse graphql response")?;
@@ -437,7 +458,8 @@ fn update_branch(
         serde_json::json!({ "expected_head_sha": expected_head_sha });
     let body_bytes = serde_json::to_vec(&body)?;
     let url = format!(
-        "{API}/repos/{owner}/{repo}/pulls/{number}/update-branch"
+        "{}/repos/{owner}/{repo}/pulls/{number}/update-branch",
+        api_base()
     );
     t.request("PUT", &url, Some(&body_bytes))
         .context("pulls.update-branch")?;
@@ -445,88 +467,39 @@ fn update_branch(
     Ok(())
 }
 
-/// Invoke `curl` against the GitHub API.
-///
-/// The bearer token is piped in via a curl config file on stdin so it
-/// never appears in argv / `/proc/<pid>/cmdline`. Request bodies are
-/// likewise placed in the config as `data-binary = "..."` with
-/// backslash escapes for `\` and `"`.
-fn curl(
-    bin: &str,
+/// Send an HTTP request to the GitHub API via reqwest's blocking
+/// client. The token is attached as a bearer credential, so it never
+/// hits a command line.
+fn send(
+    client: &reqwest::blocking::Client,
     token: &str,
     method: &str,
     url: &str,
     body: Option<&[u8]>,
 ) -> anyhow::Result<Vec<u8>> {
-    let mut config = String::new();
-    config.push_str(&format!(
-        "header = \"Authorization: Bearer {}\"\n",
-        cfg_escape(token)
-    ));
-    config.push_str(
-        "header = \"Accept: application/vnd.github+json\"\n",
-    );
-    config
-        .push_str("header = \"X-GitHub-Api-Version: 2022-11-28\"\n");
-    config.push_str(&format!("user-agent = \"{USER_AGENT}\"\n"));
-    config
-        .push_str(&format!("request = \"{}\"\n", cfg_escape(method)));
-    config.push_str(&format!("url = \"{}\"\n", cfg_escape(url)));
+    let m = reqwest::Method::from_bytes(method.as_bytes())
+        .context("invalid HTTP method")?;
+    let mut req = client
+        .request(m, url)
+        .bearer_auth(token)
+        .header("Accept", "application/vnd.github+json")
+        .header("X-GitHub-Api-Version", "2022-11-28");
     if let Some(b) = body {
-        let body_str = std::str::from_utf8(b)
-            .context("non-utf8 request body")?;
-        config.push_str(
-            "header = \"Content-Type: application/json\"\n",
-        );
-        config.push_str(&format!(
-            "data-binary = \"{}\"\n",
-            cfg_escape(body_str)
-        ));
+        req = req
+            .header("Content-Type", "application/json")
+            .body(b.to_vec());
     }
-
-    let mut child = Command::new(bin)
-        .args([
-            "--silent",
-            "--show-error",
-            "--fail-with-body",
-            "--location",
-            "--config",
-            "-",
-        ])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .context("spawning curl")?;
-    child
-        .stdin
-        .as_mut()
-        .expect("stdin piped")
-        .write_all(config.as_bytes())
-        .context("writing curl config")?;
-    let out = child.wait_with_output().context("waiting for curl")?;
-    if !out.status.success() {
+    let resp = req.send().context("sending request")?;
+    let status = resp.status();
+    let bytes = resp.bytes().context("reading response body")?;
+    if !status.is_success() {
         bail!(
-            "curl failed ({}): {}",
-            out.status,
-            String::from_utf8_lossy(&out.stderr)
+            "request failed ({}): {}",
+            status,
+            String::from_utf8_lossy(&bytes)
         );
     }
-    Ok(out.stdout)
-}
-
-/// Escape a string for use inside a `"..."` value in a curl config
-/// file. Only `\` and `"` need escaping.
-fn cfg_escape(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for c in s.chars() {
-        match c {
-            '\\' => out.push_str("\\\\"),
-            '"' => out.push_str("\\\""),
-            _ => out.push(c),
-        }
-    }
-    out
+    Ok(bytes.to_vec())
 }
 
 /// Percent-encode a query-parameter value using the unreserved set
@@ -799,19 +772,6 @@ pub(crate) mod tests {
         assert_eq!(
             percent_encode("is:open is:pr author:DominicBurkart"),
             "is%3Aopen%20is%3Apr%20author%3ADominicBurkart"
-        );
-    }
-
-    #[test]
-    fn cfg_escape_quotes_and_backslashes() {
-        assert_eq!(cfg_escape(r#"a"b\c"#), r#"a\"b\\c"#);
-    }
-
-    #[test]
-    fn cfg_escape_plain_string_unchanged() {
-        assert_eq!(
-            cfg_escape("Bearer ghp_abc123"),
-            "Bearer ghp_abc123"
         );
     }
 
@@ -1200,145 +1160,241 @@ pub(crate) mod tests {
         run_with(&t);
     }
 
-    // ----- CurlTransport -----
+    // ----- ReqwestTransport / send / run -----
 
-    #[cfg(unix)]
-    #[test]
-    fn curl_transport_defaults_bin_to_curl() {
-        let _guard = ENV_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        // Safety: guarded by ENV_LOCK.
-        unsafe { std::env::remove_var("PRODDER_CURL_BIN") };
-        let t = CurlTransport::new("tok");
-        assert_eq!(t.bin, "curl");
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn curl_transport_honors_env_override() {
-        let _guard = ENV_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        // Safety: guarded by ENV_LOCK.
-        unsafe { std::env::set_var("PRODDER_CURL_BIN", "/opt/curl") };
-        let t = CurlTransport::new("tok");
-        // Safety: guarded by ENV_LOCK.
-        unsafe { std::env::remove_var("PRODDER_CURL_BIN") };
-        assert_eq!(t.bin, "/opt/curl");
-    }
-
-    // ----- public `run` wrapper (exercises CurlTransport construction) -----
-
-    #[cfg(unix)]
-    #[test]
-    fn run_wraps_curl_transport() {
-        let _guard = ENV_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let stub = write_stub_script(r#"{"items":[]}"#, 0);
-        // Safety: guarded by ENV_LOCK.
-        unsafe { std::env::set_var("PRODDER_CURL_BIN", &stub) };
-        let res = run("tok");
-        // Safety: guarded by ENV_LOCK.
-        unsafe { std::env::remove_var("PRODDER_CURL_BIN") };
-        assert!(res.is_ok(), "run failed: {res:?}");
-    }
-
-    // ----- curl (subprocess) -----
-
-    #[cfg(unix)]
     pub static ENV_LOCK: std::sync::Mutex<()> =
         std::sync::Mutex::new(());
 
-    #[cfg(unix)]
-    fn uniq() -> u64 {
-        use std::sync::atomic::{AtomicU64, Ordering};
-        static N: AtomicU64 = AtomicU64::new(0);
-        N.fetch_add(1, Ordering::Relaxed)
+    /// Spin up a single-shot HTTP server bound to 127.0.0.1, returning
+    /// the URL prefix and a join handle whose payload is the recorded
+    /// request bytes. The server reads one HTTP request, replies with
+    /// `response`, and exits. Used to drive the real reqwest client
+    /// without touching the network.
+    pub fn spawn_one_shot_server(
+        response: &'static [u8],
+    ) -> (String, std::thread::JoinHandle<Vec<u8>>) {
+        use std::io::{Read, Write};
+        let listener =
+            std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let url = format!("http://{addr}");
+        let handle = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(
+                    std::time::Duration::from_secs(5),
+                ))
+                .unwrap();
+            let mut req = Vec::new();
+            let mut buf = [0u8; 1024];
+            loop {
+                let n = match stream.read(&mut buf) {
+                    Ok(n) if n > 0 => n,
+                    _ => break,
+                };
+                req.extend_from_slice(&buf[..n]);
+                if request_is_complete(&req) {
+                    break;
+                }
+            }
+            stream.write_all(response).unwrap();
+            req
+        });
+        (url, handle)
     }
 
-    /// Write a shell script that drains stdin and emits a fixed body.
-    /// Returns the absolute path of the script (executable).
-    #[cfg(unix)]
-    pub fn write_stub_script(body: &str, exit: i32) -> String {
-        use std::io::Write as _;
-        use std::os::unix::fs::PermissionsExt as _;
-        let dir = std::env::temp_dir();
-        let stem =
-            format!("prodder_stub_{}_{}", std::process::id(), uniq());
-        let body_path = dir.join(format!("{stem}.body"));
-        std::fs::write(&body_path, body).unwrap();
-        let script_path = dir.join(format!("{stem}.sh"));
-        let script = format!(
-            "#!/bin/sh\ncat > /dev/null\ncat {body_path:?}\nexit {exit}\n"
+    fn request_is_complete(req: &[u8]) -> bool {
+        let Some(headers_end) =
+            req.windows(4).position(|w| w == b"\r\n\r\n")
+        else {
+            return false;
+        };
+        let header_str =
+            std::str::from_utf8(&req[..headers_end]).unwrap_or("");
+        let content_length = header_str
+            .lines()
+            .find_map(|l| {
+                let lower = l.to_ascii_lowercase();
+                lower
+                    .strip_prefix("content-length:")
+                    .map(|v| v.trim().parse::<usize>().unwrap_or(0))
+            })
+            .unwrap_or(0);
+        req.len() >= headers_end + 4 + content_length
+    }
+
+    pub fn ok_response(body: &str) -> Vec<u8> {
+        let mut out = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        )
+        .into_bytes();
+        out.extend_from_slice(body.as_bytes());
+        out
+    }
+
+    fn status_response(code: u16, body: &str) -> Vec<u8> {
+        let mut out = format!(
+            "HTTP/1.1 {code} ERR\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        )
+        .into_bytes();
+        out.extend_from_slice(body.as_bytes());
+        out
+    }
+
+    fn leak<T: 'static>(v: T) -> &'static T {
+        Box::leak(Box::new(v))
+    }
+
+    #[test]
+    fn reqwest_transport_new_succeeds() {
+        let t = ReqwestTransport::new("tok").unwrap();
+        assert_eq!(t.token, "tok");
+    }
+
+    #[test]
+    fn reqwest_transport_get_round_trips() {
+        let resp: &'static [u8] = leak(ok_response(r#"{"ok":true}"#));
+        let (url, handle) = spawn_one_shot_server(resp);
+        let t = ReqwestTransport::new("tok").unwrap();
+        let body =
+            t.request("GET", &format!("{url}/things"), None).unwrap();
+        assert_eq!(body, br#"{"ok":true}"#);
+        let raw_req = handle.join().unwrap();
+        let req_str = String::from_utf8_lossy(&raw_req);
+        assert!(req_str.starts_with("GET /things HTTP/1.1"));
+        assert!(req_str.contains("authorization: Bearer tok"));
+        assert!(
+            req_str.contains("accept: application/vnd.github+json")
         );
-        let mut f = std::fs::File::create(&script_path).unwrap();
-        f.write_all(script.as_bytes()).unwrap();
-        let mut perms = f.metadata().unwrap().permissions();
-        perms.set_mode(0o755);
-        std::fs::set_permissions(&script_path, perms).unwrap();
-        script_path.to_string_lossy().into_owned()
+        assert!(req_str.contains("x-github-api-version: 2022-11-28"));
+        assert!(
+            req_str.to_lowercase().contains("user-agent: prodder")
+        );
     }
 
-    #[cfg(unix)]
     #[test]
-    fn curl_get_returns_stub_body() {
-        let stub = write_stub_script("hello", 0);
-        let out =
-            curl(&stub, "tok", "GET", "https://x/y", None).unwrap();
-        assert_eq!(out, b"hello");
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn curl_post_with_body_returns_stub_body() {
-        let stub = write_stub_script("pong", 0);
-        let out = curl(
-            &stub,
+    fn send_post_attaches_body_and_content_type() {
+        let resp: &'static [u8] = leak(ok_response("{}"));
+        let (url, handle) = spawn_one_shot_server(resp);
+        let client = reqwest::blocking::Client::builder()
+            .user_agent(USER_AGENT)
+            .build()
+            .unwrap();
+        let body = send(
+            &client,
             "tok",
             "POST",
-            "https://x/y",
-            Some(b"{\"a\":1}"),
+            &format!("{url}/graphql"),
+            Some(b"{\"q\":1}"),
         )
         .unwrap();
-        assert_eq!(out, b"pong");
+        assert_eq!(body, b"{}");
+        let raw_req = handle.join().unwrap();
+        let req_str = String::from_utf8_lossy(&raw_req);
+        assert!(req_str.starts_with("POST /graphql HTTP/1.1"));
+        assert!(req_str.contains("content-type: application/json"));
+        assert!(req_str.ends_with("{\"q\":1}"));
     }
 
-    #[cfg(unix)]
     #[test]
-    fn curl_reports_failure_exit_code() {
-        let stub = write_stub_script("err", 1);
+    fn send_returns_err_on_non_success_status() {
+        let resp: &'static [u8] = leak(status_response(500, "boom"));
+        let (url, handle) = spawn_one_shot_server(resp);
+        let client = reqwest::blocking::Client::builder()
+            .user_agent(USER_AGENT)
+            .build()
+            .unwrap();
         let err =
-            curl(&stub, "tok", "GET", "https://x", None).unwrap_err();
-        assert!(err.to_string().contains("curl failed"));
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn curl_rejects_non_utf8_body() {
-        let stub = write_stub_script("unused", 0);
-        let err = curl(
-            &stub,
-            "tok",
-            "POST",
-            "https://x",
-            Some(&[0xFF, 0xFE]),
-        )
-        .unwrap_err();
-        assert!(err.to_string().contains("non-utf8"));
+            send(&client, "tok", "GET", &format!("{url}/x"), None)
+                .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("request failed"), "{msg}");
+        assert!(msg.contains("500"), "{msg}");
+        let _ = handle.join();
     }
 
     #[test]
-    fn curl_fails_to_spawn_missing_binary() {
-        let err = curl(
-            "/nonexistent/prodder-curl-stub",
+    fn send_rejects_invalid_method() {
+        let client = reqwest::blocking::Client::builder()
+            .user_agent(USER_AGENT)
+            .build()
+            .unwrap();
+        let err = send(
+            &client,
             "tok",
-            "GET",
-            "https://x",
+            "BAD METHOD",
+            "http://127.0.0.1:1",
             None,
         )
         .unwrap_err();
-        assert!(err.to_string().contains("spawning curl"));
+        assert!(err.to_string().contains("invalid HTTP method"));
+    }
+
+    #[test]
+    fn send_bubbles_transport_error() {
+        // Port 1 is reserved/unreachable on most systems; reqwest
+        // surfaces a connection error which `send` wraps with
+        // `sending request`.
+        let client = reqwest::blocking::Client::builder()
+            .user_agent(USER_AGENT)
+            .timeout(std::time::Duration::from_millis(200))
+            .build()
+            .unwrap();
+        let err = send(
+            &client,
+            "tok",
+            "GET",
+            "http://127.0.0.1:1/never",
+            None,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("sending request"));
+    }
+
+    #[test]
+    fn run_wraps_reqwest_transport() {
+        let _guard = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let resp: &'static [u8] =
+            leak(ok_response(r#"{"items":[]}"#));
+        let (url, handle) = spawn_one_shot_server(resp);
+        // Safety: guarded by ENV_LOCK.
+        unsafe { std::env::set_var("PRODDER_API_BASE", &url) };
+        let res = run("tok");
+        // Safety: guarded by ENV_LOCK.
+        unsafe { std::env::remove_var("PRODDER_API_BASE") };
+        assert!(res.is_ok(), "run failed: {res:?}");
+        let _ = handle.join();
+    }
+
+    #[test]
+    fn api_base_defaults_to_github() {
+        let _guard = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Safety: guarded by ENV_LOCK.
+        unsafe { std::env::remove_var("PRODDER_API_BASE") };
+        assert_eq!(api_base(), DEFAULT_API);
+    }
+
+    #[test]
+    fn api_base_honors_env_override() {
+        let _guard = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Safety: guarded by ENV_LOCK.
+        unsafe {
+            std::env::set_var(
+                "PRODDER_API_BASE",
+                "http://localhost:1234",
+            );
+        }
+        let got = api_base();
+        // Safety: guarded by ENV_LOCK.
+        unsafe { std::env::remove_var("PRODDER_API_BASE") };
+        assert_eq!(got, "http://localhost:1234");
     }
 }

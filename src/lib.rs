@@ -1,6 +1,11 @@
 //! Library entry points for the `prodder` binary. Exists so the binary's
 //! `main` reduces to a single call and all logic is unit-testable.
 
+// reqwest's transitive dependency tree pulls in two versions of
+// `getrandom` and `windows-sys`. Neither is something we can resolve
+// without upstream changes, so allow the clippy lint at the crate root.
+#![allow(clippy::multiple_crate_versions)]
+
 use std::env;
 
 use tracing_subscriber::FmtSubscriber;
@@ -107,26 +112,36 @@ mod tests {
         assert!(real_main().is_err());
     }
 
-    #[cfg(unix)]
     #[test]
-    fn real_main_runs_with_stubbed_curl() {
-        // Uses PRODDER_CURL_BIN to point drafter's curl at a stub that
-        // returns an empty search. Exercises the full real_main path.
+    fn real_main_runs_with_stubbed_api() {
+        // Points drafter at a one-shot HTTP server that returns an
+        // empty search result, exercising the full real_main path
+        // through the reqwest transport.
         let _guard = ENV_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let stub = crate::drafter::tests::write_stub_script(
-            r#"{"items": []}"#,
-            0,
+        // The drafter test module owns a separate ENV_LOCK; both
+        // guard `PRODDER_API_BASE`. Acquire that one too so a
+        // concurrent drafter test doesn't tear our env var out from
+        // under us.
+        let _drafter_guard = crate::drafter::tests::ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let body: &'static [u8] = Box::leak(
+            crate::drafter::tests::ok_response(r#"{"items":[]}"#)
+                .into_boxed_slice(),
         );
+        let (url, handle) =
+            crate::drafter::tests::spawn_one_shot_server(body);
         // Safety: guarded by ENV_LOCK.
         unsafe {
             env::set_var("GH_TOKEN", "x");
-            env::set_var("PRODDER_CURL_BIN", &stub);
+            env::set_var("PRODDER_API_BASE", &url);
         }
         let res = real_main();
         // Safety: guarded by ENV_LOCK.
-        unsafe { env::remove_var("PRODDER_CURL_BIN") };
+        unsafe { env::remove_var("PRODDER_API_BASE") };
         assert!(res.is_ok(), "real_main failed: {res:?}");
+        let _ = handle.join();
     }
 }
