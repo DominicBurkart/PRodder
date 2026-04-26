@@ -67,12 +67,11 @@ struct ReqwestTransport<'a> {
 }
 
 impl<'a> ReqwestTransport<'a> {
-    fn new(token: &'a str) -> anyhow::Result<Self> {
-        let client = reqwest::blocking::Client::builder()
-            .user_agent(USER_AGENT)
-            .build()
-            .context("building HTTP client")?;
-        Ok(Self { token, client })
+    fn new(token: &'a str) -> Self {
+        Self {
+            token,
+            client: reqwest::blocking::Client::new(),
+        }
     }
 }
 
@@ -177,8 +176,7 @@ fn classify(
 /// parse, and per-PR errors are logged and swallowed so the cycle as a
 /// whole makes best-effort progress.
 pub fn run(token: &str) -> anyhow::Result<()> {
-    let transport = ReqwestTransport::new(token)?;
-    run_with(&transport);
+    run_with(&ReqwestTransport::new(token));
     Ok(())
 }
 
@@ -483,7 +481,8 @@ fn send(
         .request(m, url)
         .bearer_auth(token)
         .header("Accept", "application/vnd.github+json")
-        .header("X-GitHub-Api-Version", "2022-11-28");
+        .header("X-GitHub-Api-Version", "2022-11-28")
+        .header("User-Agent", USER_AGENT);
     if let Some(b) = body {
         req = req
             .header("Content-Type", "application/json")
@@ -1249,7 +1248,7 @@ pub(crate) mod tests {
 
     #[test]
     fn reqwest_transport_new_succeeds() {
-        let t = ReqwestTransport::new("tok").unwrap();
+        let t = ReqwestTransport::new("tok");
         assert_eq!(t.token, "tok");
     }
 
@@ -1257,7 +1256,7 @@ pub(crate) mod tests {
     fn reqwest_transport_get_round_trips() {
         let resp: &'static [u8] = leak(ok_response(r#"{"ok":true}"#));
         let (url, handle) = spawn_one_shot_server(resp);
-        let t = ReqwestTransport::new("tok").unwrap();
+        let t = ReqwestTransport::new("tok");
         let body =
             t.request("GET", &format!("{url}/things"), None).unwrap();
         assert_eq!(body, br#"{"ok":true}"#);
@@ -1278,10 +1277,7 @@ pub(crate) mod tests {
     fn send_post_attaches_body_and_content_type() {
         let resp: &'static [u8] = leak(ok_response("{}"));
         let (url, handle) = spawn_one_shot_server(resp);
-        let client = reqwest::blocking::Client::builder()
-            .user_agent(USER_AGENT)
-            .build()
-            .unwrap();
+        let client = reqwest::blocking::Client::new();
         let body = send(
             &client,
             "tok",
@@ -1302,10 +1298,7 @@ pub(crate) mod tests {
     fn send_returns_err_on_non_success_status() {
         let resp: &'static [u8] = leak(status_response(500, "boom"));
         let (url, handle) = spawn_one_shot_server(resp);
-        let client = reqwest::blocking::Client::builder()
-            .user_agent(USER_AGENT)
-            .build()
-            .unwrap();
+        let client = reqwest::blocking::Client::new();
         let err =
             send(&client, "tok", "GET", &format!("{url}/x"), None)
                 .unwrap_err();
@@ -1317,10 +1310,7 @@ pub(crate) mod tests {
 
     #[test]
     fn send_rejects_invalid_method() {
-        let client = reqwest::blocking::Client::builder()
-            .user_agent(USER_AGENT)
-            .build()
-            .unwrap();
+        let client = reqwest::blocking::Client::new();
         let err = send(
             &client,
             "tok",
@@ -1338,7 +1328,6 @@ pub(crate) mod tests {
         // surfaces a connection error which `send` wraps with
         // `sending request`.
         let client = reqwest::blocking::Client::builder()
-            .user_agent(USER_AGENT)
             .timeout(std::time::Duration::from_millis(200))
             .build()
             .unwrap();
