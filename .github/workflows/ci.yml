@@ -49,10 +49,11 @@ jobs:
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: "1.85"
+          components: llvm-tools-preview
       - uses: taiki-e/install-action@v2
         with:
-          tool: cargo-tarpaulin
-      - run: cargo tarpaulin --all-features --ignore-tests --out Lcov --output-dir .
+          tool: cargo-llvm-cov
+      - run: cargo llvm-cov --all-features --ignore-filename-regex 'src/(main|bin/launcher)\.rs' --lcov --output-path lcov.info
       - uses: codecov/codecov-action@v5
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
