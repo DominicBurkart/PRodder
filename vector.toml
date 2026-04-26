@@ -1,0 +1,30 @@
+[sources.stdin]
+type = "stdin"
+
+
+[transforms.enrich_stdin]
+type = "remap"
+inputs = ["stdin"]
+source = '''
+.source = "stdin"
+'''
+
+[transforms.throttler]
+type = "throttle"
+inputs = ["enrich_stdin"]
+threshold = 500
+window_secs = 3600
+
+[transforms.enrich_logs]
+type = "remap"
+inputs = ["throttler"]
+source = '''
+.service = "prodder"
+'''
+
+[sinks.logs]
+type = "datadog_logs"
+inputs = ["enrich_logs"]
+default_api_key = "${DATADOG_API_KEY}"
+compression = "gzip"
+site = "datadoghq.eu"
