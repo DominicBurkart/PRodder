@@ -2,4 +2,8 @@
 # `src/main.rs` is a one-line delegating shim (`prodder::real_main()`)
 # that cannot be exercised from within `cargo test`; all meaningful
 # logic lives in `src/lib.rs` and `src/drafter.rs`.
-exclude-files = ["src/main.rs"]
+#
+# `src/wasm.rs` holds wasm-only stubs that are not compiled when
+# tarpaulin runs on a native host; excluded explicitly so the file
+# never appears in coverage diffs as a 0%-covered new file.
+exclude-files = ["src/main.rs", "src/wasm.rs"]

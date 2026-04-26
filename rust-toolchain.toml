@@ -1,2 +1,8 @@
 [toolchain]
 channel = "1.85"
+# Note: we deliberately do NOT list `targets = [...]` here. CI jobs
+# install only the target they need via `dtolnay/rust-toolchain`'s
+# `targets:` input; declaring wasm targets globally caused rustup to
+# eagerly download them on every platform, which broke the
+# `x86_64-pc-windows-msvc` build. Local dev that needs wasm should run
+# `rustup target add wasm32-wasip1 wasm32-unknown-unknown`.

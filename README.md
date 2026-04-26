@@ -21,6 +21,10 @@ git clone https://github.com/DominicBurkart/PRodder/ && cd PRodder && GH_KEY=[cl
 
 PRodder runs as a one-shot job. The reference deployment runs in a [Scaleway serverless container job](https://www.scaleway.com/en/serverless-jobs/).
 
+## Targets
+
+Native builds (Linux/macOS/Windows, x86_64 and aarch64) are tier-1. `wasm32-wasip1` and `wasm32-unknown-unknown` compile (`cargo check`) in CI on a non-blocking basis — tracked in [#19](https://github.com/DominicBurkart/PRodder/issues/19). The browser-WASM `GH_TOKEN` injection story is deferred until an HTTP client with a browser-compatible backend lands.
+
 ## License
 
 Dual-licensed under [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE).
