@@ -124,7 +124,8 @@ fn decide(
     combined_state: &str,
     checks: &[CheckRun],
 ) -> Action {
-    match classify(mergeable, combined_state, checks) {
+    match classify(mergeable, mergeable_state, combined_state, checks)
+    {
         BlockDecision::Block(r) => Action::Draft(r),
         BlockDecision::Unknown => Action::Retry,
         BlockDecision::Ok => {
@@ -145,12 +146,25 @@ struct CheckRun {
 }
 
 /// Pure classifier — unit-tested without any network or subprocess.
+///
+/// Policy: a PR is `Block`ed (and therefore drafted) when GitHub reports
+/// a non-review reason it cannot merge — merge conflicts, a failing
+/// combined status, or a failed/cancelled/timed-out/action-required/stale
+/// check run. Review-only blockers (`mergeable_state == "blocked"` with
+/// no failing checks) deliberately do **not** trigger drafting; humans
+/// drive review.
+///
+/// `mergeable_state == "dirty"` is treated as conclusive evidence of a
+/// merge conflict even when `mergeable` itself is still `null` — GitHub
+/// computes the boolean asynchronously, so the state field is the more
+/// reliable signal in that window.
 fn classify(
     mergeable: Option<bool>,
+    mergeable_state: &str,
     combined_state: &str,
     checks: &[CheckRun],
 ) -> BlockDecision {
-    if mergeable == Some(false) {
+    if mergeable == Some(false) || mergeable_state == "dirty" {
         return BlockDecision::Block("merge conflicts".into());
     }
     if combined_state == "failure" || combined_state == "error" {
@@ -703,7 +717,18 @@ pub(crate) mod tests {
     #[test]
     fn conflict_blocks() {
         assert!(matches!(
-            classify(Some(false), "success", &[]),
+            classify(Some(false), "dirty", "success", &[]),
+            BlockDecision::Block(_)
+        ));
+    }
+
+    #[test]
+    fn dirty_state_blocks_even_when_mergeable_unknown() {
+        // GitHub computes the `mergeable` boolean asynchronously, so it
+        // can be null while `mergeable_state` already reports "dirty".
+        // The dirty state is conclusive — draft the PR.
+        assert!(matches!(
+            classify(None, "dirty", "success", &[]),
             BlockDecision::Block(_)
         ));
     }
@@ -712,7 +737,7 @@ pub(crate) mod tests {
     fn failing_check_blocks() {
         let checks = vec![check("ci", "completed", Some("failure"))];
         assert!(matches!(
-            classify(Some(true), "success", &checks),
+            classify(Some(true), "blocked", "success", &checks),
             BlockDecision::Block(_)
         ));
     }
@@ -720,7 +745,7 @@ pub(crate) mod tests {
     #[test]
     fn failing_combined_status_blocks() {
         assert!(matches!(
-            classify(Some(true), "failure", &[]),
+            classify(Some(true), "blocked", "failure", &[]),
             BlockDecision::Block(_)
         ));
     }
@@ -732,7 +757,7 @@ pub(crate) mod tests {
             check("lint", "completed", Some("neutral")),
         ];
         assert_eq!(
-            classify(Some(true), "success", &checks),
+            classify(Some(true), "clean", "success", &checks),
             BlockDecision::Ok
         );
     }
@@ -741,7 +766,17 @@ pub(crate) mod tests {
     fn in_progress_check_is_not_blocking() {
         let checks = vec![check("ci", "in_progress", None)];
         assert_eq!(
-            classify(Some(true), "pending", &checks),
+            classify(Some(true), "clean", "pending", &checks),
+            BlockDecision::Ok
+        );
+    }
+
+    #[test]
+    fn review_only_blocked_state_is_not_drafted() {
+        // `mergeable_state == "blocked"` without any failing checks
+        // typically means missing required reviews. Humans handle that.
+        assert_eq!(
+            classify(Some(true), "blocked", "success", &[]),
             BlockDecision::Ok
         );
     }
@@ -749,7 +784,7 @@ pub(crate) mod tests {
     #[test]
     fn unknown_mergeable_is_unknown() {
         assert_eq!(
-            classify(None, "success", &[]),
+            classify(None, "unknown", "success", &[]),
             BlockDecision::Unknown
         );
     }
@@ -809,8 +844,16 @@ pub(crate) mod tests {
         let checks =
             vec![check("ci", "completed", Some("timed_out"))];
         assert!(matches!(
-            classify(Some(true), "success", &checks),
+            classify(Some(true), "blocked", "success", &checks),
             BlockDecision::Block(_)
+        ));
+    }
+
+    #[test]
+    fn decide_dirty_drafts_when_mergeable_unknown() {
+        assert!(matches!(
+            decide(None, "dirty", "pending", &[]),
+            Action::Draft(_)
         ));
     }
 
