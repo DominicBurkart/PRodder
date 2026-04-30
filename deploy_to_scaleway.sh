@@ -7,20 +7,19 @@
 #   - pushes it to rg.fr-par.scw.cloud/prodder/prodder:latest
 #   - the next scheduled run of the `prodder` job definition picks it up
 #
-# One-time bootstrap (done manually; kept here for reproducibility):
+# One-time bootstrap (done manually; kept here for reproducibility).
+# Specific values (schedule, resource limits, timeout) are intentionally
+# omitted — query the live job definition with `scw jobs definition list`
+# rather than mirroring them here, since comments inevitably drift.
 #
 #   scw registry namespace create name=prodder region=fr-par
 #
 #   scw jobs definition create \
 #     name=prodder \
-#     cpu-limit=70 \
-#     memory-limit=128 \
 #     image-uri=rg.fr-par.scw.cloud/prodder/prodder:latest \
-#     job-timeout=180 \
-#     cron-schedule.schedule='07,53 2 * * *' \
-#     cron-schedule.timezone=Europe/Paris
+#     <cpu-limit / memory-limit / job-timeout / cron-schedule.* per current spec>
 #
-#   JOB_ID=$(scw jobs definition list name=prodder -o json | jq -r '.[0].id')
+#   JOB_ID=$(scw jobs definition list -o json | jq -r '.[] | select(.name=="prodder") | .id')
 #   GH_TOKEN_SM_ID=$(scw secret secret list name=GH_TOKEN -o json | jq -r '.[0].id')
 #   DATADOG_SM_ID=$(scw secret secret list name=personal-datadog-account-api-key \
 #     -o json | jq -r '.[0].id')
@@ -79,5 +78,5 @@ skopeo copy --dest-tls-verify=true \
 echo "=> pushed ${DEST}"
 echo "   next scheduled run of the prodder job will pull the new image."
 echo "   to trigger immediately:"
-echo "     JOB_ID=\$(scw jobs definition list name=prodder -o json | jq -r '.[0].id')"
+echo "     JOB_ID=\$(scw jobs definition list -o json | jq -r '.[] | select(.name==\"prodder\") | .id')"
 echo "     scw jobs definition start \$JOB_ID"
