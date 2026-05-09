@@ -1,5 +1,8 @@
 [default]
-# `src/main.rs` is a one-line delegating shim (`prodder::real_main()`)
-# that cannot be exercised from within `cargo test`; all meaningful
-# logic lives in `src/lib.rs` and `src/drafter.rs`.
-exclude-files = ["src/main.rs"]
+# Both binaries are thin process shims: `src/main.rs` delegates to
+# `prodder::real_main()`, and `src/bin/launcher.rs` `Command::spawn`s
+# `prodder` and (optionally) pipes its stdout into `vector` for the
+# Datadog sidecar. Neither is exercisable from `cargo test` without
+# mocking process spawning; all meaningful logic lives in `src/lib.rs`
+# and `src/drafter.rs`.
+exclude-files = ["src/main.rs", "src/bin/launcher.rs"]

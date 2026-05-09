@@ -41,6 +41,12 @@
           CARGO_PROFILE_RELEASE_OPT_LEVEL = "s";
         });
 
+        vectorConfig = pkgs.writeTextFile {
+          name = "prodder-vector-config";
+          destination = "/etc/vector/vector.toml";
+          text = builtins.readFile ./vector.toml;
+        };
+
         container = pkgs.dockerTools.buildLayeredImage {
           name = "prodder";
           tag = "latest";
@@ -48,13 +54,15 @@
           contents = with pkgs; [
             cacert
             curl
+            vector
+            vectorConfig
           ];
 
           config = {
-            Cmd = [ "${prodder}/bin/prodder" ];
+            Cmd = [ "${prodder}/bin/launcher" ];
             Env = [
               "SSL_CERT_FILE=${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt"
-              "PATH=/bin:/usr/bin:${prodder}/bin:${pkgs.curl}/bin"
+              "PATH=/bin:/usr/bin:${prodder}/bin:${pkgs.curl}/bin:${pkgs.vector}/bin"
             ];
           };
         };
