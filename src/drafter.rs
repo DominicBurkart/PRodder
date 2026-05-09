@@ -34,6 +34,12 @@ const USER_AGENT: &str = "PRodder";
 /// to GitHub's secondary rate limits while still finishing the workload
 /// (~60 PRs) inside Scaleway's 3-minute job timeout.
 const PR_CONCURRENCY: usize = 8;
+/// Page size for the search/issues request. GitHub caps `per_page` at
+/// 100 for the Search API.
+const PER_PAGE: usize = 100;
+/// Hard cap on pages walked. GitHub's Search API caps total results at
+/// 1000, so 10 × 100 covers the entire authored-PR queue.
+const MAX_PAGES: usize = 10;
 
 /// Resolve the GitHub API base URL, allowing tests to point at a local
 /// server via `PRODDER_API_BASE`.
@@ -278,8 +284,45 @@ async fn process_candidate<T: Transport>(t: &T, c: CandidatePr) {
 async fn list_candidate_prs<T: Transport>(
     t: &T,
 ) -> anyhow::Result<Vec<CandidatePr>> {
+    list_candidate_prs_with(t, PER_PAGE, MAX_PAGES).await
+}
+
+/// Walk paginated `search/issues` results and resolve each into a
+/// `CandidatePr`. Pulled out as a separate function so tests can drive
+/// it with smaller page sizes and a tighter page cap.
+async fn list_candidate_prs_with<T: Transport>(
+    t: &T,
+    per_page: usize,
+    max_pages: usize,
+) -> anyhow::Result<Vec<CandidatePr>> {
+    let mut items: Vec<Value> = Vec::new();
+    for page in 1..=max_pages {
+        let chunk = search_page(t, page, per_page)
+            .await
+            .with_context(|| format!("search issues page {page}"))?;
+        let n = chunk.len();
+        items.extend(chunk);
+        if n < per_page {
+            break;
+        }
+    }
+
+    let candidates: Vec<CandidatePr> = stream::iter(items)
+        .map(|issue| fetch_candidate(t, issue))
+        .buffer_unordered(PR_CONCURRENCY)
+        .filter_map(|c| async move { c })
+        .collect()
+        .await;
+    Ok(candidates)
+}
+
+async fn search_page<T: Transport>(
+    t: &T,
+    page: usize,
+    per_page: usize,
+) -> anyhow::Result<Vec<Value>> {
     let url = format!(
-        "{}/search/issues?q={}&per_page=100",
+        "{}/search/issues?q={}&sort=created&order=asc&per_page={per_page}&page={page}",
         api_base(),
         percent_encode(SEARCH_QUERY)
     );
@@ -289,19 +332,10 @@ async fn list_candidate_prs<T: Transport>(
         .context("search issues")?;
     let v: Value = serde_json::from_slice(&body)
         .context("parse search response")?;
-    let items = v
-        .get("items")
+    Ok(v.get("items")
         .and_then(|v| v.as_array())
         .cloned()
-        .unwrap_or_default();
-
-    let candidates: Vec<CandidatePr> = stream::iter(items)
-        .map(|issue| fetch_candidate(t, issue))
-        .buffer_unordered(PR_CONCURRENCY)
-        .filter_map(|c| async move { c })
-        .collect()
-        .await;
-    Ok(candidates)
+        .unwrap_or_default())
 }
 
 async fn fetch_candidate<T: Transport>(
@@ -990,6 +1024,98 @@ pub(crate) mod tests {
     async fn list_candidate_prs_propagates_search_error() {
         let t = MockTransport::new().queue_err("search boom");
         assert!(list_candidate_prs(&t).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn list_candidate_prs_uses_deterministic_ordering() {
+        let t = MockTransport::new().queue_ok(br#"{"items":[]}"#);
+        let _ = list_candidate_prs(&t).await.unwrap();
+        let calls = t.calls();
+        assert_eq!(calls.len(), 1);
+        let url = &calls[0].1;
+        assert!(url.contains("/search/issues"), "url: {url}");
+        assert!(url.contains("sort=created"), "url: {url}");
+        assert!(url.contains("order=asc"), "url: {url}");
+        assert!(url.contains("page=1"), "url: {url}");
+        assert!(url.contains("per_page=100"), "url: {url}");
+    }
+
+    #[tokio::test]
+    async fn list_candidate_prs_walks_multiple_pages() {
+        // per_page=2: page 1 is full (2 items) → loop continues; page 2
+        // is partial (1 item) → loop exits. Verify both pages are
+        // fetched and all 3 candidates resolve.
+        let full_page = br#"{"items":[
+            {"repository_url":"https://api.github.com/repos/DominicBurkart/committer","number":1},
+            {"repository_url":"https://api.github.com/repos/DominicBurkart/committer","number":2}
+        ]}"#;
+        let partial_page = br#"{"items":[
+            {"repository_url":"https://api.github.com/repos/DominicBurkart/committer","number":3}
+        ]}"#;
+        let pr1 = br#"{"node_id":"PR_1","head":{"sha":"sha1"}}"#;
+        let pr2 = br#"{"node_id":"PR_2","head":{"sha":"sha2"}}"#;
+        let pr3 = br#"{"node_id":"PR_3","head":{"sha":"sha3"}}"#;
+        let t = MockTransport::new()
+            .queue_ok(full_page)
+            .queue_ok(partial_page)
+            .queue_ok(pr1)
+            .queue_ok(pr2)
+            .queue_ok(pr3);
+        let out = list_candidate_prs_with(&t, 2, 10).await.unwrap();
+        assert_eq!(out.len(), 3);
+        let calls = t.calls();
+        let search_calls: Vec<&RecordedCall> = calls
+            .iter()
+            .filter(|c| c.1.contains("/search/issues"))
+            .collect();
+        assert_eq!(search_calls.len(), 2);
+        assert!(search_calls[0].1.contains("page=1"));
+        assert!(search_calls[1].1.contains("page=2"));
+    }
+
+    #[tokio::test]
+    async fn list_candidate_prs_stops_at_max_pages() {
+        // per_page=1, max_pages=2: each page reports a full result, so
+        // the loop would continue indefinitely without the cap. Verify
+        // we stop at page 2 even though signals say "more available".
+        let item = br#"{"items":[{"repository_url":"https://api.github.com/repos/DominicBurkart/committer","number":1}]}"#;
+        let pr = br#"{"node_id":"PR_1","head":{"sha":"deadbeef"}}"#;
+        let t = MockTransport::new()
+            .queue_ok(item)
+            .queue_ok(item)
+            .queue_ok(pr)
+            .queue_ok(pr);
+        let out = list_candidate_prs_with(&t, 1, 2).await.unwrap();
+        assert_eq!(out.len(), 2);
+        let calls = t.calls();
+        let search_call_count = calls
+            .iter()
+            .filter(|c| c.1.contains("/search/issues"))
+            .count();
+        assert_eq!(
+            search_call_count, 2,
+            "max_pages cap was not honored"
+        );
+    }
+
+    #[tokio::test]
+    async fn list_candidate_prs_propagates_late_page_error() {
+        // Page 1 returns a full result; page 2 errors. The error should
+        // bubble up, with context naming the page.
+        let full_page = br#"{"items":[
+            {"repository_url":"https://api.github.com/repos/DominicBurkart/committer","number":1},
+            {"repository_url":"https://api.github.com/repos/DominicBurkart/committer","number":2}
+        ]}"#;
+        let t = MockTransport::new()
+            .queue_ok(full_page)
+            .queue_err("page 2 boom");
+        let err =
+            list_candidate_prs_with(&t, 2, 10).await.unwrap_err();
+        let chain = format!("{err:#}");
+        assert!(
+            chain.contains("page 2"),
+            "missing page context: {chain}"
+        );
     }
 
     // ----- evaluate -----
